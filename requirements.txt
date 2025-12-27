@@ -1,0 +1,4 @@
+# FGF G-code Post Processor
+# Core dependencies
+
+numpy>=1.21.0
