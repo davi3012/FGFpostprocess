@@ -46,6 +46,10 @@ class ProcessorConfig:
     # Velocità minima come percentuale della velocità originale
     min_speed_ratio: float = 0.1
     
+    # Risoluzione segmentazione nelle rampe (mm)
+    # Movimenti più lunghi di questo valore vengono suddivisi
+    segment_resolution: float = 0.5
+    
     # Feature types da processare (None = tutti)
     target_features: Optional[List[str]] = None
 
@@ -83,6 +87,37 @@ class GCodeProcessor:
         
         return True
     
+    def _is_in_ramp_zone(self, dist_from_start: float, dist_to_end: float, 
+                          ramp_up: float, ramp_down: float) -> bool:
+        """Verifica se una posizione è in una zona di rampa."""
+        return dist_from_start < ramp_up or dist_to_end < ramp_down
+    
+    def _generate_segment_command(
+        self,
+        start_x: float, start_y: float, start_z: float, start_e: float,
+        end_x: float, end_y: float, end_z: float, end_e: float,
+        feedrate: float, phase: str, speed_factor: float,
+        has_z: bool
+    ) -> GCodeCommand:
+        """Genera un comando G1 per un segmento."""
+        params = {
+            "X": end_x,
+            "Y": end_y,
+            "E": end_e,
+            "F": feedrate
+        }
+        if has_z:
+            params["Z"] = end_z
+        
+        return GCodeCommand(
+            line_number=0,
+            raw_line="",
+            command="G1",
+            params=params,
+            comment=f"{phase} {speed_factor*100:.0f}%",
+            _modified=True
+        )
+    
     def _apply_smoothing_to_path(
         self, 
         path: ExtrusionPath
@@ -92,6 +127,7 @@ class GCodeProcessor:
         
         Modifica il feedrate (F) per creare accelerazione/decelerazione
         graduale, mantenendo invariato il volume di estrusione (E).
+        Segmenta i movimenti lunghi nelle zone di rampa per transizioni graduali.
         
         Args:
             path: Percorso da processare
@@ -108,11 +144,14 @@ class GCodeProcessor:
             self.config.ramp_down_length
         )
         
+        total_length = path.total_length
+        resolution = self.config.segment_resolution
+        
         # Aggiungi commento di inizio
         result.append(GCodeCommand(
             line_number=0,
             raw_line="",
-            comment=f"PRESSURE_SMOOTHING_START: {path.feature_type}, length={path.total_length:.2f}mm",
+            comment=f"PRESSURE_SMOOTHING_START: {path.feature_type}, length={total_length:.2f}mm",
             _modified=True
         ))
         result.append(GCodeCommand(
@@ -124,65 +163,114 @@ class GCodeProcessor:
         
         # Calcola distanza cumulativa per ogni movimento
         cumulative_distance = 0.0
-        move_distances: List[float] = []
         
         for move in path.moves:
-            move_distances.append(cumulative_distance)
-            cumulative_distance += move.length
-        
-        total_length = path.total_length
-        
-        # Processa ogni movimento
-        for i, move in enumerate(path.moves):
-            dist_from_start = move_distances[i] + (move.length / 2)  # Centro del movimento
-            dist_to_end = total_length - dist_from_start
+            move_start_dist = cumulative_distance
+            move_end_dist = cumulative_distance + move.length
             
-            # Calcola fattore di velocità
-            speed_factor = calculate_speed_factor(
-                dist_from_start,
-                dist_to_end,
-                eff_ramp_up,
-                eff_ramp_down,
-                self.config.ramp_up_curve,
-                self.config.ramp_down_curve
-            )
+            # Coordinate del movimento
+            sx, sy, sz = move.start_point.x, move.start_point.y, move.start_point.z
+            ex, ey, ez = move.end_point.x, move.end_point.y, move.end_point.z
+            se, ee = move.start_point.e, move.end_point.e
+            has_z = "Z" in move.command.params
             
-            # Applica velocità minima
-            speed_factor = max(speed_factor, self.config.min_speed_ratio)
+            # Verifica se il movimento attraversa zone di rampa
+            in_ramp_up = move_start_dist < eff_ramp_up
+            in_ramp_down = move_end_dist > (total_length - eff_ramp_down)
+            needs_segmentation = (in_ramp_up or in_ramp_down) and move.length > resolution
             
-            # Calcola nuovo feedrate
-            original_feedrate = move.feedrate
-            new_feedrate = original_feedrate * speed_factor
-            
-            # Crea nuovo comando con feedrate modificato
-            new_params = move.command.params.copy()
-            new_params["F"] = new_feedrate
-            
-            # Determina la fase per il commento
-            if dist_from_start < eff_ramp_up:
-                phase = f"RAMP_UP {speed_factor*100:.0f}%"
-            elif dist_to_end < eff_ramp_down:
-                phase = f"RAMP_DOWN {speed_factor*100:.0f}%"
+            if needs_segmentation:
+                # Segmenta il movimento
+                num_segments = max(2, int(move.length / resolution))
+                
+                # Estrusione per segmento (usa il delta relativo, non i valori assoluti)
+                e_per_segment = move.extrusion / num_segments
+                
+                for seg_idx in range(num_segments):
+                    # Progresso nel movimento (0 to 1)
+                    t0 = seg_idx / num_segments
+                    t1 = (seg_idx + 1) / num_segments
+                    t_mid = (t0 + t1) / 2
+                    
+                    # Distanza dal percorso per questo segmento
+                    seg_dist = move_start_dist + move.length * t_mid
+                    seg_dist_to_end = total_length - seg_dist
+                    
+                    # Calcola speed factor per questo segmento
+                    speed_factor = calculate_speed_factor(
+                        seg_dist,
+                        seg_dist_to_end,
+                        eff_ramp_up,
+                        eff_ramp_down,
+                        self.config.ramp_up_curve,
+                        self.config.ramp_down_curve
+                    )
+                    speed_factor = max(speed_factor, self.config.min_speed_ratio)
+                    
+                    # Interpola coordinate XYZ
+                    seg_ex = sx + (ex - sx) * t1
+                    seg_ey = sy + (ey - sy) * t1
+                    seg_ez = sz + (ez - sz) * t1
+                    
+                    # Determina fase
+                    if seg_dist < eff_ramp_up:
+                        phase = "RAMP_UP"
+                    elif seg_dist_to_end < eff_ramp_down:
+                        phase = "RAMP_DOWN"
+                    else:
+                        phase = "STEADY"
+                    
+                    # Calcola feedrate
+                    new_feedrate = move.feedrate * speed_factor
+                    
+                    cmd = self._generate_segment_command(
+                        sx + (ex - sx) * t0, sy + (ey - sy) * t0, sz + (ez - sz) * t0, 0,
+                        seg_ex, seg_ey, seg_ez, e_per_segment,
+                        new_feedrate, phase, speed_factor, has_z
+                    )
+                    result.append(cmd)
             else:
-                phase = "STEADY"
+                # Movimento non necessita segmentazione
+                dist_mid = move_start_dist + move.length / 2
+                dist_to_end = total_length - dist_mid
+                
+                speed_factor = calculate_speed_factor(
+                    dist_mid,
+                    dist_to_end,
+                    eff_ramp_up,
+                    eff_ramp_down,
+                    self.config.ramp_up_curve,
+                    self.config.ramp_down_curve
+                )
+                speed_factor = max(speed_factor, self.config.min_speed_ratio)
+                
+                new_feedrate = move.feedrate * speed_factor
+                
+                # Determina fase
+                if dist_mid < eff_ramp_up:
+                    phase = f"RAMP_UP {speed_factor*100:.0f}%"
+                elif dist_to_end < eff_ramp_down:
+                    phase = f"RAMP_DOWN {speed_factor*100:.0f}%"
+                else:
+                    phase = "STEADY"
+                
+                new_params = move.command.params.copy()
+                new_params["F"] = new_feedrate
+                
+                original_comment = move.command.comment or ""
+                new_comment = f"{original_comment} ; {phase}" if original_comment else phase
+                
+                new_cmd = GCodeCommand(
+                    line_number=move.command.line_number,
+                    raw_line=move.command.raw_line,
+                    command="G1",
+                    params=new_params,
+                    comment=new_comment,
+                    _modified=True
+                )
+                result.append(new_cmd)
             
-            # Preserva commento originale se presente
-            original_comment = move.command.comment or ""
-            if original_comment:
-                new_comment = f"{original_comment} ; {phase}"
-            else:
-                new_comment = phase
-            
-            new_cmd = GCodeCommand(
-                line_number=move.command.line_number,
-                raw_line=move.command.raw_line,
-                command="G1",
-                params=new_params,
-                comment=new_comment,
-                _modified=True
-            )
-            
-            result.append(new_cmd)
+            cumulative_distance = move_end_dist
         
         # Aggiungi commento di fine
         result.append(GCodeCommand(

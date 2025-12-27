@@ -98,6 +98,13 @@ Curve disponibili:
         help="Velocità minima come percentuale (0.0-1.0) della velocità originale (default: 0.1)"
     )
     
+    parser.add_argument(
+        "--resolution",
+        type=float,
+        default=0.5,
+        help="Risoluzione segmentazione nelle rampe in mm (default: 0.5)"
+    )
+    
     args = parser.parse_args()
     
     # Verifica file input
@@ -113,7 +120,8 @@ Curve disponibili:
         ramp_up_curve=args.curve_up,
         ramp_down_curve=args.curve_down,
         min_path_length=args.min_length,
-        min_speed_ratio=args.min_speed
+        min_speed_ratio=args.min_speed,
+        segment_resolution=args.resolution
     )
     
     # Processa
@@ -125,6 +133,7 @@ Curve disponibili:
     print(f"  Ramp-down:  {config.ramp_down_length}mm ({config.ramp_down_curve.value})")
     print(f"  Min length: {config.min_path_length}mm")
     print(f"  Min speed:  {config.min_speed_ratio*100:.0f}%")
+    print(f"  Resolution: {config.segment_resolution}mm")
     print()
     
     processor = GCodeProcessor(config)
