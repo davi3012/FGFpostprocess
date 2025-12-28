@@ -31,7 +31,7 @@ st.title("🔧 FGF G-code Post Processor - Debug")
 def parse_gcode_for_visualization(filepath: str) -> dict:
     """Parsa G-code ed estrae dati per visualizzazione."""
     points = []
-    current_pos = {"X": 0, "Y": 0, "Z": 0, "F": 1000}
+    current_pos = {"X": 0, "Y": 0, "Z": 0, "E": 0, "F": 1000}
     relative_e = False
     
     with open(filepath, "r", encoding="utf-8") as f:
@@ -42,33 +42,46 @@ def parse_gcode_for_visualization(filepath: str) -> dict:
                 relative_e = True
             elif line.startswith("M82"):
                 relative_e = False
-            elif line.startswith("G1"):
+            elif line.startswith("G92"):
+                # Reset E
+                import re
+                for match in re.finditer(r"E(-?\.?\d+\.?\d*)", line):
+                    current_pos["E"] = float(match.group(1))
+            elif line.startswith("G1") or line.startswith("G0"):
                 # Estrai parametri
                 params = {}
                 import re
                 for match in re.finditer(r"([XYZEF])(-?\.?\d+\.?\d*)", line):
                     params[match.group(1)] = float(match.group(2))
                 
+                # Determina se è estrusione PRIMA di aggiornare posizione
+                is_extrusion = False
+                if "E" in params:
+                    e_val = params["E"]
+                    if relative_e:
+                        # Estrusione relativa: positivo = estrude, negativo = retract
+                        is_extrusion = e_val > 0
+                        current_pos["E"] += e_val
+                    else:
+                        # Estrusione assoluta: confronta con valore precedente
+                        is_extrusion = e_val > current_pos["E"]
+                        current_pos["E"] = e_val
+                
                 # Aggiorna posizione
-                has_move = False
+                has_xy_move = False
                 if "X" in params:
                     current_pos["X"] = params["X"]
-                    has_move = True
+                    has_xy_move = True
                 if "Y" in params:
                     current_pos["Y"] = params["Y"]
-                    has_move = True
+                    has_xy_move = True
                 if "Z" in params:
                     current_pos["Z"] = params["Z"]
-                    has_move = True
                 if "F" in params:
                     current_pos["F"] = params["F"]
                 
-                # Determina se è estrusione
-                is_extrusion = "E" in params
-                if relative_e and is_extrusion:
-                    is_extrusion = params["E"] > 0
-                
-                if has_move:
+                # Aggiungi punto solo se c'è movimento XY
+                if has_xy_move:
                     points.append({
                         "x": current_pos["X"],
                         "y": current_pos["Y"],
@@ -189,49 +202,19 @@ with st.sidebar.expander("📈 Preview Curve"):
     st.plotly_chart(plot_curve_comparison(), use_container_width=True)
 
 # Main area
-col1, col2 = st.columns([1, 1])
+st.header("📂 G-code Post Processor")
 
-with col1:
-    st.header("📂 Input G-code")
-    uploaded_file = st.file_uploader("Carica file G-code", type=["gcode", "gco", "nc"])
-    
-    if uploaded_file:
-        # Salva file temporaneo
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".gcode") as tmp:
-            tmp.write(uploaded_file.getvalue())
-            input_path = tmp.name
-        
-        st.success(f"File caricato: {uploaded_file.name}")
-        
-        # Parsing per visualizzazione
-        with st.spinner("Parsing G-code..."):
-            input_points = parse_gcode_for_visualization(input_path)
-        
-        st.info(f"Punti trovati: {len(input_points)}")
-        
-        # Filtro Z
-        if input_points:
-            z_values = [p["z"] for p in input_points]
-            z_min_data, z_max_data = min(z_values), max(z_values)
-            
-            z_range = st.slider(
-                "Filtro Z (layer)",
-                float(z_min_data), float(z_max_data),
-                (float(z_min_data), min(float(z_min_data) + 5, float(z_max_data))),
-                0.1
-            )
-            
-            extrusion_only = st.checkbox("Solo estrusione", value=True)
-            
-            with st.spinner("Generazione preview 3D..."):
-                fig_input = create_3d_plot(input_points, True, extrusion_only, z_range)
-            
-            st.plotly_chart(fig_input, use_container_width=True)
+uploaded_file = st.file_uploader("Carica file G-code", type=["gcode", "gco", "nc"])
 
-with col2:
-    st.header("🔄 Output Processato")
+if uploaded_file:
+    # Salva file temporaneo
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".gcode") as tmp:
+        tmp.write(uploaded_file.getvalue())
+        input_path = tmp.name
     
-    if uploaded_file and st.button("▶️ Processa G-code", type="primary"):
+    st.success(f"✅ File caricato: {uploaded_file.name}")
+    
+    if st.button("▶️ Processa G-code", type="primary", use_container_width=True):
         # Crea configurazione
         config = ProcessorConfig(
             ramp_up_length=ramp_up,
@@ -247,30 +230,25 @@ with col2:
         output_path = input_path.replace(".gcode", "_processed.gcode")
         
         # Processa
-        with st.spinner("Processing..."):
+        with st.spinner("🔄 Processing in corso..."):
             processor = GCodeProcessor(config)
             stats = processor.process_file(input_path, output_path)
         
-        st.success("Processing completato!")
+        st.success("✅ Processing completato!")
         
         # Statistiche
-        col_stats1, col_stats2 = st.columns(2)
-        with col_stats1:
-            st.metric("Percorsi trovati", stats.paths_found)
-            st.metric("Percorsi processati", stats.paths_processed)
-        with col_stats2:
-            st.metric("Percorsi saltati", stats.paths_skipped)
-            st.metric("Tempo (s)", f"{stats.processing_time:.2f}")
+        st.subheader("📊 Statistiche")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Percorsi trovati", f"{stats.paths_found:,}")
+        with col2:
+            st.metric("Percorsi processati", f"{stats.paths_processed:,}")
+        with col3:
+            st.metric("Percorsi saltati", f"{stats.paths_skipped:,}")
+        with col4:
+            st.metric("Tempo", f"{stats.processing_time:.1f}s")
         
-        # Parsing output
-        with st.spinner("Parsing output..."):
-            output_points = parse_gcode_for_visualization(output_path)
-        
-        # Usa stesso filtro Z dell'input
-        with st.spinner("Generazione preview 3D output..."):
-            fig_output = create_3d_plot(output_points, True, extrusion_only, z_range)
-        
-        st.plotly_chart(fig_output, use_container_width=True)
+        st.metric("Lunghezza totale processata", f"{stats.total_path_length:,.2f} mm")
         
         # Download
         with open(output_path, "r") as f:
@@ -280,17 +258,19 @@ with col2:
             label="📥 Download G-code processato",
             data=output_content,
             file_name=f"{uploaded_file.name.replace('.gcode', '')}_processed.gcode",
-            mime="text/plain"
+            mime="text/plain",
+            type="primary",
+            use_container_width=True
         )
         
         # Cleanup
         try:
             os.unlink(output_path)
+            os.unlink(input_path)
         except:
             pass
-    
-    elif not uploaded_file:
-        st.info("👆 Carica un file G-code per iniziare")
+else:
+    st.info("👆 Carica un file G-code per iniziare")
 
 # Footer
 st.markdown("---")

@@ -190,15 +190,18 @@ class GCodeProcessor:
                     # Progresso nel movimento (0 to 1)
                     t0 = seg_idx / num_segments
                     t1 = (seg_idx + 1) / num_segments
-                    t_mid = (t0 + t1) / 2
                     
-                    # Distanza dal percorso per questo segmento
-                    seg_dist = move_start_dist + move.length * t_mid
-                    seg_dist_to_end = total_length - seg_dist
+                    # Distanza all'inizio del segmento (non al centro)
+                    seg_start_dist = move_start_dist + move.length * t0
+                    seg_end_dist = move_start_dist + move.length * t1
+                    seg_mid_dist = (seg_start_dist + seg_end_dist) / 2
+                    
+                    # Usa distanza media per calcolare speed factor
+                    seg_dist_to_end = total_length - seg_mid_dist
                     
                     # Calcola speed factor per questo segmento
                     speed_factor = calculate_speed_factor(
-                        seg_dist,
+                        seg_mid_dist,
                         seg_dist_to_end,
                         eff_ramp_up,
                         eff_ramp_down,
@@ -212,10 +215,10 @@ class GCodeProcessor:
                     seg_ey = sy + (ey - sy) * t1
                     seg_ez = sz + (ez - sz) * t1
                     
-                    # Determina fase
-                    if seg_dist < eff_ramp_up:
+                    # Determina fase basata sulla distanza di inizio segmento
+                    if seg_start_dist < eff_ramp_up:
                         phase = "RAMP_UP"
-                    elif seg_dist_to_end < eff_ramp_down:
+                    elif (total_length - seg_start_dist) < eff_ramp_down:
                         phase = "RAMP_DOWN"
                     else:
                         phase = "STEADY"
