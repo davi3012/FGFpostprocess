@@ -1,6 +1,6 @@
 # FGF G-code Post Processor
 
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://your-app-url.streamlit.app)
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://fgfpostprocess.streamlit.app)
 
 Post-processor per G-code ottimizzato per stampanti 3D a pellet (FGF - Fused Granulate Fabrication). Applica pressure smoothing con rampe di accelerazione/decelerazione per compensare il lag di pressione tipico dei sistemi ad estrusione di pellet.
 
