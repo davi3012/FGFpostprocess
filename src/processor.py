@@ -315,6 +315,8 @@ class GCodeProcessor:
         
         # 3. Crea mappa linea -> percorso per sostituzione efficiente
         line_to_path: Dict[int, ExtrusionPath] = {}
+        lines_to_remove: set = set()  # Linee da rimuovere (percorsi troppo corti)
+        
         for path in paths:
             if self._should_process_path(path):
                 for move in path.moves:
@@ -322,10 +324,13 @@ class GCodeProcessor:
                 self.stats.paths_processed += 1
                 self.stats.total_path_length += path.total_length
             else:
+                # Percorso troppo corto - rimuovi completamente
+                for move in path.moves:
+                    lines_to_remove.add(move.line_number)
                 self.stats.paths_skipped += 1
         
         print(f"  Percorsi da processare: {self.stats.paths_processed}")
-        print(f"  Percorsi saltati: {self.stats.paths_skipped}")
+        print(f"  Percorsi saltati (rimossi): {self.stats.paths_skipped}")
         
         # 4. Genera output
         print("Generazione output...")
@@ -334,6 +339,10 @@ class GCodeProcessor:
         
         for cmd in commands:
             line_num = cmd.line_number
+            
+            # Salta linee da rimuovere (percorsi troppo corti)
+            if line_num in lines_to_remove:
+                continue
             
             # Verifica se questa linea fa parte di un percorso da processare
             if line_num in line_to_path:

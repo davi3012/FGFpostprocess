@@ -215,6 +215,14 @@ class PathAnalyzer:
                     current_path = None
                 self.state.current_feature = feature
             
+            # Chiudi percorso se incontriamo commenti di fine estrusione
+            if cmd.comment and any(marker in cmd.comment for marker in ["WIPE_START", "WIPE_END"]):
+                if current_path and current_path.moves:
+                    current_path.end_line = current_path.moves[-1].line_number
+                    paths.append(current_path)
+                    current_path = None
+                continue
+            
             # Gestisci comandi che cambiano modalità
             if cmd.command in ("M82", "M83", "G92"):
                 # Chiudi percorso corrente
