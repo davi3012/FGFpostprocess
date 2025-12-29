@@ -260,6 +260,7 @@ class PathAnalyzer:
                         paths.append(current_path)
                         current_path = None
                 # else: comando solo feedrate (G1 F...) - non chiude percorso
+                # Questi comandi vengono usati per cambiare velocità all'interno di un percorso
                 
                 self.state.update_from_command(cmd)
             

@@ -38,11 +38,10 @@ ENV/
 Thumbs.db
 
 # Project specific
-examples/*.gcode
-!examples/D02_PETG_9h31m.gcode
 *.gcode
 output_*.gcode
 *_processed*.gcode
+!examples/*.gcode
 
 # Python cache
 __pycache__/
