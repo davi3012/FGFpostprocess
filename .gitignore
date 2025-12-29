@@ -44,6 +44,10 @@ examples/*.gcode
 output_*.gcode
 *_processed*.gcode
 
+# Python cache
+__pycache__/
+*.pyc
+
 # Temporary files
 *.tmp
 *.log
