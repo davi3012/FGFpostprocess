@@ -250,11 +250,16 @@ class PathAnalyzer:
                 self.state.update_from_command(cmd)
             
             elif cmd.command in ("G0", "G1"):
-                # Movimento senza estrusione (travel) - chiude il percorso
-                if current_path and current_path.moves:
-                    current_path.end_line = current_path.moves[-1].line_number
-                    paths.append(current_path)
-                    current_path = None
+                # Distingui tra travel move e feedrate-only command
+                has_movement = any(axis in cmd.params for axis in ["X", "Y", "Z"])
+                
+                if has_movement:
+                    # Movimento senza estrusione (travel) - chiude il percorso
+                    if current_path and current_path.moves:
+                        current_path.end_line = current_path.moves[-1].line_number
+                        paths.append(current_path)
+                        current_path = None
+                # else: comando solo feedrate (G1 F...) - non chiude percorso
                 
                 self.state.update_from_command(cmd)
             
