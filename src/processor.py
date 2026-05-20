@@ -116,6 +116,7 @@ class _Line:
     dE: float = 0.0          # delta E (positivo per extrude)
     F: float = 0.0           # mm/min
     relative_e: bool = False
+    relative_xyz: bool = False
 
     # smoothing (extrude)
     vol: float = 0.0         # mm^3/min
@@ -193,7 +194,8 @@ class GCodeProcessor:
         x = y = z = 0.0
         e_abs = 0.0
         f = 0.0
-        rel_e = False
+        rel_e = False         # modo estrusore (M82/M83)
+        rel_xyz = False       # modo coordinate (G90/G91)
 
         out: List[_Line] = []
 
@@ -204,6 +206,14 @@ class GCodeProcessor:
                 continue
             if cmd.command == "M83":
                 rel_e = True
+                out.append(_Line(cmd_idx=idx, kind="other"))
+                continue
+            if cmd.command == "G90":
+                rel_xyz = False
+                out.append(_Line(cmd_idx=idx, kind="other"))
+                continue
+            if cmd.command == "G91":
+                rel_xyz = True
                 out.append(_Line(cmd_idx=idx, kind="other"))
                 continue
             if cmd.command == "G92":
@@ -240,9 +250,14 @@ class GCodeProcessor:
                 out.append(_Line(cmd_idx=idx, kind="other"))
                 continue
 
-            ex = cmd.params.get("X", x)
-            ey = cmd.params.get("Y", y)
-            ez = cmd.params.get("Z", z)
+            if rel_xyz:
+                ex = x + cmd.params.get("X", 0.0)
+                ey = y + cmd.params.get("Y", 0.0)
+                ez = z + cmd.params.get("Z", 0.0)
+            else:
+                ex = cmd.params.get("X", x)
+                ey = cmd.params.get("Y", y)
+                ez = cmd.params.get("Z", z)
 
             if has_e:
                 if rel_e:
@@ -272,6 +287,7 @@ class GCodeProcessor:
                 dE=dE if dE > 0 else 0.0,
                 F=new_f,
                 relative_e=rel_e,
+                relative_xyz=rel_xyz,
             )
 
             # classifica
@@ -600,9 +616,10 @@ class GCodeProcessor:
     ) -> List[GCodeCommand]:
         out: List[GCodeCommand] = []
 
-        # tracking dello stato E in uscita (assoluto/relativo)
+        # tracking dello stato in uscita
         e_abs = 0.0
         rel_e = False
+        rel_xyz = False
 
         last_emitted_idx = -1
 
@@ -616,13 +633,21 @@ class GCodeProcessor:
             last_emitted_idx = cmd_idx
             cmd = commands[cmd_idx]
 
-            # gestisci modalita' E
+            # gestisci modalita' E e XYZ
             if cmd.command == "M82":
                 rel_e = False
                 out.append(cmd)
                 continue
             if cmd.command == "M83":
                 rel_e = True
+                out.append(cmd)
+                continue
+            if cmd.command == "G90":
+                rel_xyz = False
+                out.append(cmd)
+                continue
+            if cmd.command == "G91":
+                rel_xyz = True
                 out.append(cmd)
                 continue
             if cmd.command == "G92":
@@ -647,10 +672,23 @@ class GCodeProcessor:
             self.stats.micro_segments_emitted += len(microsegs)
 
             comment = cmd.comment
+            # punto precedente in coordinate assolute (per derivare deltas in G91)
+            prev_x, prev_y, prev_z = L.sx, L.sy, L.sz
+
             for j, ms in enumerate(microsegs):
-                params: Dict[str, float] = {"X": ms["x"], "Y": ms["y"]}
-                if ms["has_z"]:
-                    params["Z"] = ms["z"]
+                params: Dict[str, float] = {}
+                if rel_xyz:
+                    params["X"] = ms["x"] - prev_x
+                    params["Y"] = ms["y"] - prev_y
+                    if ms["has_z"]:
+                        params["Z"] = ms["z"] - prev_z
+                else:
+                    params["X"] = ms["x"]
+                    params["Y"] = ms["y"]
+                    if ms["has_z"]:
+                        params["Z"] = ms["z"]
+                prev_x, prev_y, prev_z = ms["x"], ms["y"], ms["z"]
+
                 # E
                 if rel_e:
                     params["E"] = ms["dE"]
