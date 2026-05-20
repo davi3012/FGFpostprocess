@@ -48,10 +48,6 @@ def main() -> None:
         help="Pendenza decelerazione (mm^3/s^2). Se <=0 usa --slope-pos. Default: 0.0",
     )
     p.add_argument(
-        "--filament-diameter", type=float, default=1.75,
-        help="Diametro filamento equivalente / pellet_flow_coefficient (mm). Default: 1.75",
-    )
-    p.add_argument(
         "--max-seg-len", type=float, default=2.0,
         help="Lunghezza max dei sotto-segmenti dello split (mm). Default: 2.0",
     )
@@ -78,7 +74,6 @@ def main() -> None:
     cfg = ProcessorConfig(
         max_volumetric_extrusion_rate_slope=args.slope_pos,
         pellet_ers_deceleration_slope=args.slope_neg,
-        pellet_flow_coefficient=args.filament_diameter,
         max_seg_len=args.max_seg_len,
         travel_threshold=args.travel_threshold,
         pellet_ers_min_rate=args.min_rate,
@@ -92,8 +87,6 @@ def main() -> None:
           f"({cfg.slope_pos_min:.1f} mm^3/min^2)")
     print(f"  slope_neg        : {cfg.pellet_ers_deceleration_slope} mm^3/s^2 "
           f"({cfg.slope_neg_min:.1f} mm^3/min^2)")
-    print(f"  filament_diameter: {cfg.pellet_flow_coefficient} mm "
-          f"(A_f = {cfg.filament_area:.4f} mm^2)")
     print(f"  max_seg_len      : {cfg.max_seg_len} mm")
     print(f"  travel_threshold : {cfg.travel_threshold} mm")
     print(f"  min_rate         : {cfg.pellet_ers_min_rate} mm^3/s "

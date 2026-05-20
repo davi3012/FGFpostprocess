@@ -158,9 +158,9 @@ slope_neg = st.sidebar.number_input(
     "pellet_ers_deceleration_slope (mm³/s², 0 = usa slope_pos)",
     min_value=0.0, max_value=1000.0, value=0.0, step=0.1,
 )
-filament_diameter = st.sidebar.number_input(
-    "pellet_flow_coefficient / filament_diameter (mm)",
-    min_value=0.5, max_value=10.0, value=1.75, step=0.05,
+st.sidebar.caption(
+    "ℹ️ La E del G-code per estrusori a pellet e' gia' in mm³ "
+    "(Grasshopper applica il filament_diameter a monte): nessun parametro di sezione richiesto."
 )
 max_seg_len = st.sidebar.slider(
     "max_seg_len (mm)", 0.5, 10.0, 2.0, 0.5,
@@ -201,7 +201,6 @@ if uploaded_file:
         cfg = ProcessorConfig(
             max_volumetric_extrusion_rate_slope=slope_pos,
             pellet_ers_deceleration_slope=slope_neg,
-            pellet_flow_coefficient=filament_diameter,
             max_seg_len=max_seg_len,
             travel_threshold=travel_threshold,
             pellet_ers_min_rate=min_rate,

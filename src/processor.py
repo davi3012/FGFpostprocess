@@ -3,7 +3,9 @@ Pellet ERS - Post-processore G-code (solo flusso volumetrico).
 
 Implementa la specifica matematica del Pellet ERS:
   1. Unita': mm/min, mm^3/min, mm^3/min^2.
-  2. Volume target per riga: vol = A_f * F * |dE| / dist  [mm^3/min]
+  2. Volume target per riga: vol = F * |dE| / dist  [mm^3/min]
+     (la E del G-code per estrusori a pellet e' gia' in mm^3: Grasshopper
+     applica il filament_diameter a monte, quindi NON c'e' fattore A_f).
   3. Identificazione polilinee senza marker (run massimali di righe estrudenti).
   4. Smoothing interno (passate backward + forward) basato su
         v_end = sqrt(v_start^2 + 2 * a * dist * vol / F)
@@ -46,9 +48,6 @@ class ProcessorConfig:
     max_volumetric_extrusion_rate_slope: float = 1.0  # mm^3/s^2 (accel.)
     pellet_ers_deceleration_slope: float = 0.0        # mm^3/s^2 (decel.); <=0 => uguale a accel.
 
-    # --- geometria filamento equivalente ---
-    pellet_flow_coefficient: float = 1.75  # diametro filamento equivalente (mm)
-
     # --- segmentazione e bordi ---
     max_seg_len: float = 2.0          # mm
     travel_threshold: float = 3.0     # mm (XY)
@@ -77,12 +76,6 @@ class ProcessorConfig:
     def min_rate_min(self) -> float:
         """min rate in mm^3/min."""
         return max(0.0, self.pellet_ers_min_rate) * 60.0
-
-    @property
-    def filament_area(self) -> float:
-        """A_f = pi/4 * d^2  (mm^2)."""
-        d = self.pellet_flow_coefficient
-        return math.pi * 0.25 * d * d
 
 
 @dataclass
@@ -192,8 +185,9 @@ class GCodeProcessor:
     # -------- Build -----------------------------------------------------------
 
     def _build_lines(self, commands: List[GCodeCommand]) -> List[_Line]:
-        cfg = self.config
-        A_f = cfg.filament_area
+        # NOTA: la E del G-code per pellet e' gia' espressa in mm^3
+        # (Grasshopper applica il filament_diameter a monte). Quindi non
+        # esiste alcun fattore di conversione: vol = F * |dE| / dist.
 
         # stato macchina
         x = y = z = 0.0
@@ -283,7 +277,9 @@ class GCodeProcessor:
             # classifica
             if dE > 0 and dist_xy > 0 and dist_xyz > 0 and new_f > 0:
                 line.kind = "extrude"
-                line.vol = A_f * new_f * dE / dist_xyz
+                # E e' gia' in mm^3 (estrusore a pellet, Grasshopper applica
+                # filament_diameter a monte): vol = F * |dE| / dist  [mm^3/min]
+                line.vol = new_f * dE / dist_xyz
                 line.rate_start = line.vol
                 line.rate_end = line.vol
                 self.stats.extruding_lines += 1

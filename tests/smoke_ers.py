@@ -82,7 +82,6 @@ def main() -> None:
         cfg = ProcessorConfig(
             max_volumetric_extrusion_rate_slope=1.0,
             pellet_ers_deceleration_slope=0.5,
-            pellet_flow_coefficient=1.75,
             max_seg_len=2.0,
             travel_threshold=3.0,
             pellet_ers_min_rate=0.5,
