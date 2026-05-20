@@ -1,135 +1,77 @@
 """
-Curve e logica di pressure smoothing
+Pellet ERS - profilo di interpolazione del feedrate e utility.
 
-Gestisce le curve matematiche per accelerazione/decelerazione della pressione.
+Implementa la specifica matematica del Pellet ERS (sezioni 7.4 e 7.5):
+- Profili: Linear, Sqrt, Exponential
+- Quantizzazione finale del feedrate
+
+Tutti i valori di feedrate sono in mm/min.
 """
+
+from __future__ import annotations
 
 import math
 from enum import Enum
-from typing import Callable
 
 
-class CurveType(Enum):
-    """Tipi di curve per accelerazione/decelerazione."""
+class Profile(str, Enum):
+    """Forme della curva di feedrate nelle rampe (spec §7.4)."""
     LINEAR = "linear"
+    SQRT = "sqrt"
     EXPONENTIAL = "exponential"
-    LOGARITHMIC = "logarithmic"
-    SIGMOID = "sigmoid"
-    QUADRATIC = "quadratic"
-    SCURVE = "scurve"
 
 
-def apply_curve(progress: float, curve_type: CurveType) -> float:
-    """
-    Applica una curva di smoothing al progresso.
-    
-    Args:
-        progress: Valore tra 0.0 e 1.0 che indica il progresso
-        curve_type: Tipo di curva da applicare
-        
-    Returns:
-        Valore trasformato tra 0.0 e 1.0
-    """
-    # Clamp del progresso tra 0 e 1
-    progress = max(0.0, min(1.0, progress))
-    
-    if curve_type == CurveType.LINEAR:
-        return progress
-    
-    elif curve_type == CurveType.EXPONENTIAL:
-        # Accelerazione rapida iniziale, poi rallenta
-        return (math.exp(progress * 2) - 1) / (math.exp(2) - 1)
-    
-    elif curve_type == CurveType.LOGARITHMIC:
-        # Accelerazione lenta iniziale, poi accelera
-        return math.log(1 + progress * (math.e - 1))
-    
-    elif curve_type == CurveType.SIGMOID:
-        # Curva a S centrata - smooth all'inizio e alla fine
-        return 1 / (1 + math.exp(-10 * (progress - 0.5)))
-    
-    elif curve_type == CurveType.QUADRATIC:
-        # Accelerazione quadratica
-        return progress * progress
-    
-    elif curve_type == CurveType.SCURVE:
-        # S-Curve ottimizzata per pellet extruder
-        # Prima metà: accelerazione quadratica
-        # Seconda metà: decelerazione quadratica
-        if progress < 0.5:
-            return 2 * progress * progress
-        else:
-            return 1 - 2 * (1 - progress) * (1 - progress)
-    
-    else:
-        return progress
+# Compatibilita' retroattiva: alcuni moduli/CLI possono ancora importare CurveType.
+CurveType = Profile
 
 
-def calculate_speed_factor(
-    distance_from_start: float,
-    distance_to_end: float,
-    ramp_up_length: float,
-    ramp_down_length: float,
-    ramp_up_curve: CurveType,
-    ramp_down_curve: CurveType
+def interpolate_feedrate(
+    f_start: float,
+    f_end: float,
+    t: float,
+    profile: Profile,
 ) -> float:
     """
-    Calcola il fattore di velocità per una posizione nel percorso.
-    
-    Il fattore va da 0.0 (velocità minima) a 1.0 (velocità piena).
-    
+    Interpolazione del feedrate (spec §7.4).
+
     Args:
-        distance_from_start: Distanza dall'inizio del percorso (mm)
-        distance_to_end: Distanza dalla fine del percorso (mm)
-        ramp_up_length: Lunghezza della rampa di accelerazione (mm)
-        ramp_down_length: Lunghezza della rampa di decelerazione (mm)
-        ramp_up_curve: Tipo di curva per ramp-up
-        ramp_down_curve: Tipo di curva per ramp-down
-        
-    Returns:
-        Fattore di velocità tra 0.0 e 1.0
+        f_start: feedrate all'inizio della rampa (mm/min)
+        f_end:   feedrate alla fine della rampa  (mm/min)
+        t:       parametro normalizzato in [0, 1]
+        profile: forma di curva
+
+    Funziona simmetricamente per ramp-up (f_start < f_end)
+    e ramp-down (f_start > f_end).
     """
-    # Caso: siamo nella zona di ramp-up
-    if distance_from_start < ramp_up_length:
-        progress = distance_from_start / ramp_up_length
-        return apply_curve(progress, ramp_up_curve)
-    
-    # Caso: siamo nella zona di ramp-down
-    if distance_to_end < ramp_down_length:
-        progress = distance_to_end / ramp_down_length
-        return apply_curve(progress, ramp_down_curve)
-    
-    # Caso: siamo nella zona steady (velocità piena)
-    return 1.0
+    if t <= 0.0:
+        return f_start
+    if t >= 1.0:
+        return f_end
+
+    if profile == Profile.LINEAR:
+        return f_start + (f_end - f_start) * t
+
+    if profile == Profile.SQRT:
+        # F(t) = sqrt(F_start^2 + (F_end^2 - F_start^2) * t)
+        v2 = f_start * f_start + (f_end * f_end - f_start * f_start) * t
+        if v2 < 0.0:
+            v2 = 0.0
+        return math.sqrt(v2)
+
+    if profile == Profile.EXPONENTIAL:
+        # F(t) = F_end - (F_end - F_start) * exp(-3 * t)
+        return f_end - (f_end - f_start) * math.exp(-3.0 * t)
+
+    # fallback
+    return f_start + (f_end - f_start) * t
 
 
-def calculate_effective_ramps(
-    path_length: float,
-    ramp_up_length: float,
-    ramp_down_length: float,
-    max_ramp_ratio: float = 0.8
-) -> tuple[float, float]:
+def quantize_feedrate(f: float) -> float:
     """
-    Calcola le lunghezze effettive delle rampe, adattandole alla lunghezza del percorso.
-    
-    Se il percorso è troppo corto, le rampe vengono ridotte proporzionalmente.
-    
-    Args:
-        path_length: Lunghezza totale del percorso (mm)
-        ramp_up_length: Lunghezza desiderata ramp-up (mm)
-        ramp_down_length: Lunghezza desiderata ramp-down (mm)
-        max_ramp_ratio: Percentuale massima del percorso occupabile dalle rampe
-        
-    Returns:
-        Tuple (effective_ramp_up, effective_ramp_down)
+    Quantizzazione finale del feedrate (spec §7.5):
+        F = max(60, F)
+        F = round(F / 60) * 60
     """
-    total_ramp = ramp_up_length + ramp_down_length
-    max_total_ramp = path_length * max_ramp_ratio
-    
-    if total_ramp <= max_total_ramp:
-        # Le rampe ci stanno, usale come sono
-        return ramp_up_length, ramp_down_length
-    
-    # Riduci proporzionalmente
-    ratio = max_total_ramp / total_ramp
-    return ramp_up_length * ratio, ramp_down_length * ratio
+    if f < 60.0:
+        f = 60.0
+    return round(f / 60.0) * 60.0

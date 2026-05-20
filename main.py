@@ -1,151 +1,122 @@
 """
-FGF G-code Post Processor - Entry Point CLI
+FGF G-code Post Processor - CLI (Pellet ERS)
 
 Utilizzo:
     python main.py input.gcode output.gcode [opzioni]
+
+Esempio:
+    python main.py in.gcode out.gcode \\
+        --slope-pos 1.0 --slope-neg 0.5 \\
+        --max-seg-len 2.0 --travel-threshold 3.0 \\
+        --min-rate 0.5 --profile linear \\
+        --filament-diameter 1.75
 """
+
+from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
 
-from src import GCodeProcessor, CurveType
-from src.processor import ProcessorConfig
+from src import GCodeProcessor, ProcessorConfig, Profile
 
 
-def parse_curve_type(value: str) -> CurveType:
-    """Converte stringa in CurveType."""
+def parse_profile(value: str) -> Profile:
     try:
-        return CurveType(value.lower())
+        return Profile(value.lower())
     except ValueError:
-        valid = [c.value for c in CurveType]
+        valid = [p.value for p in Profile]
         raise argparse.ArgumentTypeError(
-            f"Curva non valida: '{value}'. Valori validi: {valid}"
+            f"Profilo non valido: '{value}'. Valori validi: {valid}"
         )
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="FGF G-code Post Processor - Pressure Smoothing per stampanti a pellet",
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="FGF G-code Post Processor - Pellet ERS (smoothing volumetrico)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Esempi:
-  python main.py input.gcode output.gcode
-  python main.py input.gcode output.gcode --ramp-up 6.0 --ramp-down 4.0
-  python main.py input.gcode output.gcode --curve-up sigmoid --curve-down exponential
+    )
+    p.add_argument("input", type=str, help="File G-code di input")
+    p.add_argument("output", type=str, help="File G-code di output")
 
-Curve disponibili:
-  linear      - Accelerazione lineare
-  exponential - Accelerazione esponenziale
-  logarithmic - Accelerazione logaritmica  
-  sigmoid     - Curva a S (smooth)
-  quadratic   - Accelerazione quadratica
-  scurve      - S-Curve ottimizzata per pellet
-        """
+    p.add_argument(
+        "--slope-pos", type=float, default=1.0,
+        help="Pendenza accelerazione del flusso (mm^3/s^2). Default: 1.0",
     )
-    
-    parser.add_argument(
-        "input",
-        type=str,
-        help="File G-code di input"
+    p.add_argument(
+        "--slope-neg", type=float, default=0.0,
+        help="Pendenza decelerazione (mm^3/s^2). Se <=0 usa --slope-pos. Default: 0.0",
     )
-    
-    parser.add_argument(
-        "output", 
-        type=str,
-        help="File G-code di output"
+    p.add_argument(
+        "--filament-diameter", type=float, default=1.75,
+        help="Diametro filamento equivalente / pellet_flow_coefficient (mm). Default: 1.75",
     )
-    
-    parser.add_argument(
-        "--ramp-up",
-        type=float,
-        default=5.0,
-        help="Lunghezza rampa di accelerazione in mm (default: 5.0)"
+    p.add_argument(
+        "--max-seg-len", type=float, default=2.0,
+        help="Lunghezza max dei sotto-segmenti dello split (mm). Default: 2.0",
     )
-    
-    parser.add_argument(
-        "--ramp-down",
-        type=float,
-        default=4.0,
-        help="Lunghezza rampa di decelerazione in mm (default: 4.0)"
+    p.add_argument(
+        "--travel-threshold", type=float, default=3.0,
+        help="Soglia travel XY per attivare le rampe di confine (mm). Default: 3.0",
     )
-    
-    parser.add_argument(
-        "--curve-up",
-        type=parse_curve_type,
-        default=CurveType.SIGMOID,
-        help="Tipo di curva per ramp-up (default: sigmoid)"
+    p.add_argument(
+        "--min-rate", type=float, default=0.5,
+        help="Flusso ai bordi della rampa (mm^3/s). Default: 0.5",
     )
-    
-    parser.add_argument(
-        "--curve-down",
-        type=parse_curve_type,
-        default=CurveType.EXPONENTIAL,
-        help="Tipo di curva per ramp-down (default: exponential)"
+    p.add_argument(
+        "--profile", type=parse_profile, default=Profile.SQRT,
+        help="Profilo della rampa di feedrate: linear|sqrt|exponential. Default: sqrt",
     )
-    
-    parser.add_argument(
-        "--min-length",
-        type=float,
-        default=1.0,
-        help="Lunghezza minima percorso per applicare smoothing in mm (default: 1.0)"
-    )
-    
-    parser.add_argument(
-        "--min-speed",
-        type=float,
-        default=0.1,
-        help="Velocità minima come percentuale (0.0-1.0) della velocità originale (default: 0.1)"
-    )
-    
-    parser.add_argument(
-        "--resolution",
-        type=float,
-        default=0.5,
-        help="Risoluzione segmentazione nelle rampe in mm (default: 0.5)"
-    )
-    
-    args = parser.parse_args()
-    
-    # Verifica file input
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"Errore: File non trovato: {args.input}", file=sys.stderr)
+
+    args = p.parse_args()
+
+    in_path = Path(args.input)
+    if not in_path.exists():
+        print(f"Errore: file non trovato: {args.input}", file=sys.stderr)
         sys.exit(1)
-    
-    # Crea configurazione
-    config = ProcessorConfig(
-        ramp_up_length=args.ramp_up,
-        ramp_down_length=args.ramp_down,
-        ramp_up_curve=args.curve_up,
-        ramp_down_curve=args.curve_down,
-        min_path_length=args.min_length,
-        min_speed_ratio=args.min_speed,
-        segment_resolution=args.resolution
+
+    cfg = ProcessorConfig(
+        max_volumetric_extrusion_rate_slope=args.slope_pos,
+        pellet_ers_deceleration_slope=args.slope_neg,
+        pellet_flow_coefficient=args.filament_diameter,
+        max_seg_len=args.max_seg_len,
+        travel_threshold=args.travel_threshold,
+        pellet_ers_min_rate=args.min_rate,
+        profile=args.profile,
     )
-    
-    # Processa
-    print("=" * 60)
-    print("FGF G-code Post Processor v1.0.0")
-    print("=" * 60)
-    print(f"\nConfigurazione:")
-    print(f"  Ramp-up:    {config.ramp_up_length}mm ({config.ramp_up_curve.value})")
-    print(f"  Ramp-down:  {config.ramp_down_length}mm ({config.ramp_down_curve.value})")
-    print(f"  Min length: {config.min_path_length}mm")
-    print(f"  Min speed:  {config.min_speed_ratio*100:.0f}%")
-    print(f"  Resolution: {config.segment_resolution}mm")
+
+    print("=" * 64)
+    print("FGF G-code Post Processor - Pellet ERS")
+    print("=" * 64)
+    print(f"  slope_pos        : {cfg.max_volumetric_extrusion_rate_slope} mm^3/s^2 "
+          f"({cfg.slope_pos_min:.1f} mm^3/min^2)")
+    print(f"  slope_neg        : {cfg.pellet_ers_deceleration_slope} mm^3/s^2 "
+          f"({cfg.slope_neg_min:.1f} mm^3/min^2)")
+    print(f"  filament_diameter: {cfg.pellet_flow_coefficient} mm "
+          f"(A_f = {cfg.filament_area:.4f} mm^2)")
+    print(f"  max_seg_len      : {cfg.max_seg_len} mm")
+    print(f"  travel_threshold : {cfg.travel_threshold} mm")
+    print(f"  min_rate         : {cfg.pellet_ers_min_rate} mm^3/s "
+          f"({cfg.min_rate_min:.1f} mm^3/min)")
+    print(f"  profile          : {cfg.profile.value}")
     print()
-    
-    processor = GCodeProcessor(config)
-    stats = processor.process_file(str(input_path), args.output)
-    
-    print("\n" + "=" * 60)
+
+    proc = GCodeProcessor(cfg)
+    stats = proc.process_file(str(in_path), args.output)
+
+    print("=" * 64)
     print("Statistiche:")
-    print(f"  Percorsi trovati:    {stats.paths_found}")
-    print(f"  Percorsi processati: {stats.paths_processed}")
-    print(f"  Percorsi saltati:    {stats.paths_skipped}")
-    print(f"  Lunghezza totale:    {stats.total_path_length:.2f}mm")
-    print("=" * 60)
+    print(f"  Linee input            : {stats.input_lines}")
+    print(f"  Linee output           : {stats.output_lines}")
+    print(f"  Polilinee trovate      : {stats.polylines_found}")
+    print(f"  Polilinee dopo merge   : {stats.polylines_after_merge}")
+    print(f"  Righe estrudenti       : {stats.extruding_lines}")
+    print(f"  Righe splittate        : {stats.lines_split}")
+    print(f"  Micro-segmenti emessi  : {stats.micro_segments_emitted}")
+    print(f"  Boundary ramp-up       : {stats.boundary_rampups}")
+    print(f"  Boundary ramp-down     : {stats.boundary_rampdowns}")
+    print(f"  Tempo                  : {stats.processing_time:.2f}s")
+    print("=" * 64)
 
 
 if __name__ == "__main__":

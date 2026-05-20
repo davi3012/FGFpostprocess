@@ -1,375 +1,681 @@
 """
-Processore G-code principale
+Pellet ERS - Post-processore G-code (solo flusso volumetrico).
 
-Orchestratore che coordina parsing, analisi e applicazione del pressure smoothing.
+Implementa la specifica matematica del Pellet ERS:
+  1. Unita': mm/min, mm^3/min, mm^3/min^2.
+  2. Volume target per riga: vol = A_f * F * |dE| / dist  [mm^3/min]
+  3. Identificazione polilinee senza marker (run massimali di righe estrudenti).
+  4. Smoothing interno (passate backward + forward) basato su
+        v_end = sqrt(v_start^2 + 2 * a * dist * vol / F)
+  5. Rampe di confine (ramp-up/ramp-down) ai bordi delle polilinee
+     quando travel >= travel_threshold.
+  6. Split trapezoidale/triangolare con interpolazione del feedrate
+     (Linear, Sqrt, Exponential), ricalcolo proporzionale dell'estrusione,
+     quantizzazione finale del feedrate.
+
+Nessun marker di slicer e' richiesto: il G-code di partenza e' una sequenza
+di G1 X Y (Z) E F generata da Grasshopper, con polilinee continue.
 """
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from __future__ import annotations
+
+import math
 import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
-from .gcode_parser import GCodeParser, GCodeCommand, write_gcode
-from .path_analyzer import PathAnalyzer, ExtrusionPath, ExtrusionMove, MachineState, Point
-from .smoothing import (
-    CurveType, 
-    calculate_speed_factor, 
-    calculate_effective_ramps
-)
+from .gcode_parser import GCodeCommand, GCodeParser, write_gcode
+from .smoothing import Profile, interpolate_feedrate, quantize_feedrate
 
 
-@dataclass
-class ProcessingStats:
-    """Statistiche del processing."""
-    input_lines: int = 0
-    output_lines: int = 0
-    paths_found: int = 0
-    paths_processed: int = 0
-    paths_skipped: int = 0
-    total_path_length: float = 0.0
-    processing_time: float = 0.0
+# ---------------------------------------------------------------------------
+# Configurazione e stato
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class ProcessorConfig:
-    """Configurazione del processore."""
-    # Lunghezze rampe in mm
-    ramp_up_length: float = 5.0
-    ramp_down_length: float = 4.0
-    
-    # Tipi di curve
-    ramp_up_curve: CurveType = CurveType.SIGMOID
-    ramp_down_curve: CurveType = CurveType.EXPONENTIAL
-    
-    # Lunghezza minima percorso per applicare smoothing (mm)
-    min_path_length: float = 1.0
-    
-    # Velocità minima come percentuale della velocità originale
-    min_speed_ratio: float = 0.1
-    
-    # Risoluzione segmentazione nelle rampe (mm)
-    # Movimenti più lunghi di questo valore vengono suddivisi
-    segment_resolution: float = 0.5
-    
-    # Feature types da processare (None = tutti)
-    target_features: Optional[List[str]] = None
+    """
+    Parametri del Pellet ERS.
+
+    Le pendenze sono fornite in mm^3/s^2 (unita' utente) e convertite
+    internamente a mm^3/min^2 (* 3600). min_rate in mm^3/s -> mm^3/min (* 60).
+    """
+
+    # --- pendenze (input in mm^3/s^2) ---
+    max_volumetric_extrusion_rate_slope: float = 1.0  # mm^3/s^2 (accel.)
+    pellet_ers_deceleration_slope: float = 0.0        # mm^3/s^2 (decel.); <=0 => uguale a accel.
+
+    # --- geometria filamento equivalente ---
+    pellet_flow_coefficient: float = 1.75  # diametro filamento equivalente (mm)
+
+    # --- segmentazione e bordi ---
+    max_seg_len: float = 2.0          # mm
+    travel_threshold: float = 3.0     # mm (XY)
+
+    # --- soglia inferiore di flusso al bordo (input in mm^3/s) ---
+    pellet_ers_min_rate: float = 0.5  # mm^3/s
+
+    # --- profilo della rampa di feedrate ---
+    profile: Profile = Profile.SQRT
+
+    # ----- valori derivati (in unita' interne) -----
+    @property
+    def slope_pos_min(self) -> float:
+        """slope di accelerazione in mm^3/min^2."""
+        return max(0.0, self.max_volumetric_extrusion_rate_slope) * 3600.0
+
+    @property
+    def slope_neg_min(self) -> float:
+        """slope di decelerazione in mm^3/min^2; se non valido, uguale a slope_pos."""
+        s = self.pellet_ers_deceleration_slope
+        if s is None or s <= 0:
+            return self.slope_pos_min
+        return s * 3600.0
+
+    @property
+    def min_rate_min(self) -> float:
+        """min rate in mm^3/min."""
+        return max(0.0, self.pellet_ers_min_rate) * 60.0
+
+    @property
+    def filament_area(self) -> float:
+        """A_f = pi/4 * d^2  (mm^2)."""
+        d = self.pellet_flow_coefficient
+        return math.pi * 0.25 * d * d
+
+
+@dataclass
+class ProcessingStats:
+    input_lines: int = 0
+    output_lines: int = 0
+    polylines_found: int = 0
+    polylines_after_merge: int = 0
+    extruding_lines: int = 0
+    lines_split: int = 0
+    micro_segments_emitted: int = 0
+    boundary_rampups: int = 0
+    boundary_rampdowns: int = 0
+    processing_time: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Modello interno
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Line:
+    """Rappresentazione interna di una riga del G-code."""
+    cmd_idx: int
+    kind: str  # 'extrude' | 'travel' | 'other'
+
+    # geometria (extrude / travel)
+    sx: float = 0.0
+    sy: float = 0.0
+    sz: float = 0.0
+    ex: float = 0.0
+    ey: float = 0.0
+    ez: float = 0.0
+    dist_xyz: float = 0.0
+    dist_xy: float = 0.0
+    has_z: bool = False
+    dE: float = 0.0          # delta E (positivo per extrude)
+    F: float = 0.0           # mm/min
+    relative_e: bool = False
+
+    # smoothing (extrude)
+    vol: float = 0.0         # mm^3/min
+    rate_start: float = 0.0  # mm^3/min
+    rate_end: float = 0.0    # mm^3/min
+
+
+@dataclass
+class _Polyline:
+    first: int                  # indice in lines della prima riga 'extrude'
+    last: int                   # indice in lines dell'ultima riga 'extrude'
+    travel_before: float = 0.0  # mm XY prima della prima riga estrudente
+    travel_after: float = 0.0   # mm XY dopo l'ultima riga estrudente
+
+
+# ---------------------------------------------------------------------------
+# Processore principale
+# ---------------------------------------------------------------------------
 
 
 class GCodeProcessor:
-    """
-    Processore principale per post-processing G-code.
-    
-    Applica pressure smoothing ai percorsi di estrusione per migliorare
-    la qualità di stampa su stampanti a pellet.
-    """
-    
+    """Post-processore Pellet ERS (vedi modulo docstring)."""
+
     def __init__(self, config: Optional[ProcessorConfig] = None):
-        """
-        Inizializza il processore.
-        
-        Args:
-            config: Configurazione del processore. Se None, usa defaults.
-        """
         self.config = config or ProcessorConfig()
         self.parser = GCodeParser()
-        self.analyzer = PathAnalyzer()
         self.stats = ProcessingStats()
-    
-    def _should_process_path(self, path: ExtrusionPath) -> bool:
-        """Determina se un percorso deve essere processato."""
-        # Verifica lunghezza minima
-        if path.total_length < self.config.min_path_length:
-            return False
-        
-        # Verifica feature type se specificato
-        if self.config.target_features:
-            if path.feature_type not in self.config.target_features:
-                return False
-        
-        return True
-    
-    def _is_in_ramp_zone(self, dist_from_start: float, dist_to_end: float, 
-                          ramp_up: float, ramp_down: float) -> bool:
-        """Verifica se una posizione è in una zona di rampa."""
-        return dist_from_start < ramp_up or dist_to_end < ramp_down
-    
-    def _generate_segment_command(
-        self,
-        start_x: float, start_y: float, start_z: float, start_e: float,
-        end_x: float, end_y: float, end_z: float, end_e: float,
-        feedrate: float, phase: str, speed_factor: float,
-        has_z: bool
-    ) -> GCodeCommand:
-        """Genera un comando G1 per un segmento."""
-        params = {
-            "X": end_x,
-            "Y": end_y,
-            "E": end_e,
-            "F": feedrate
-        }
-        if has_z:
-            params["Z"] = end_z
-        
-        return GCodeCommand(
-            line_number=0,
-            raw_line="",
-            command="G1",
-            params=params,
-            comment=f"{phase} {speed_factor*100:.0f}%",
-            _modified=True
-        )
-    
-    def _apply_smoothing_to_path(
-        self, 
-        path: ExtrusionPath
-    ) -> List[GCodeCommand]:
-        """
-        Applica pressure smoothing a un percorso di estrusione.
-        
-        Modifica il feedrate (F) per creare accelerazione/decelerazione
-        graduale, mantenendo invariato il volume di estrusione (E).
-        Segmenta i movimenti lunghi nelle zone di rampa per transizioni graduali.
-        
-        Args:
-            path: Percorso da processare
-            
-        Returns:
-            Lista di comandi G-code modificati
-        """
-        result: List[GCodeCommand] = []
-        
-        # Calcola rampe effettive
-        eff_ramp_up, eff_ramp_down = calculate_effective_ramps(
-            path.total_length,
-            self.config.ramp_up_length,
-            self.config.ramp_down_length
-        )
-        
-        total_length = path.total_length
-        resolution = self.config.segment_resolution
-        
-        # Aggiungi commento di inizio
-        result.append(GCodeCommand(
-            line_number=0,
-            raw_line="",
-            comment=f"PRESSURE_SMOOTHING_START: {path.feature_type}, length={total_length:.2f}mm",
-            _modified=True
-        ))
-        result.append(GCodeCommand(
-            line_number=0,
-            raw_line="",
-            comment=f"Ramps: up={eff_ramp_up:.2f}mm ({self.config.ramp_up_curve.value}), down={eff_ramp_down:.2f}mm ({self.config.ramp_down_curve.value})",
-            _modified=True
-        ))
-        
-        # Calcola distanza cumulativa per ogni movimento
-        cumulative_distance = 0.0
-        
-        for move in path.moves:
-            move_start_dist = cumulative_distance
-            move_end_dist = cumulative_distance + move.length
-            
-            # Coordinate del movimento
-            sx, sy, sz = move.start_point.x, move.start_point.y, move.start_point.z
-            ex, ey, ez = move.end_point.x, move.end_point.y, move.end_point.z
-            se, ee = move.start_point.e, move.end_point.e
-            has_z = "Z" in move.command.params
-            
-            # Verifica se il movimento attraversa zone di rampa
-            in_ramp_up = move_start_dist < eff_ramp_up
-            in_ramp_down = move_end_dist > (total_length - eff_ramp_down)
-            needs_segmentation = (in_ramp_up or in_ramp_down) and move.length > resolution
-            
-            if needs_segmentation:
-                # Segmenta il movimento
-                num_segments = max(2, int(move.length / resolution))
-                
-                # Estrusione per segmento (usa il delta relativo, non i valori assoluti)
-                e_per_segment = move.extrusion / num_segments
-                
-                for seg_idx in range(num_segments):
-                    # Progresso nel movimento (0 to 1)
-                    t0 = seg_idx / num_segments
-                    t1 = (seg_idx + 1) / num_segments
-                    
-                    # Distanza all'inizio del segmento (non al centro)
-                    seg_start_dist = move_start_dist + move.length * t0
-                    seg_end_dist = move_start_dist + move.length * t1
-                    seg_mid_dist = (seg_start_dist + seg_end_dist) / 2
-                    
-                    # Usa distanza media per calcolare speed factor
-                    seg_dist_to_end = total_length - seg_mid_dist
-                    
-                    # Calcola speed factor per questo segmento
-                    speed_factor = calculate_speed_factor(
-                        seg_mid_dist,
-                        seg_dist_to_end,
-                        eff_ramp_up,
-                        eff_ramp_down,
-                        self.config.ramp_up_curve,
-                        self.config.ramp_down_curve
-                    )
-                    speed_factor = max(speed_factor, self.config.min_speed_ratio)
-                    
-                    # Interpola coordinate XYZ
-                    seg_ex = sx + (ex - sx) * t1
-                    seg_ey = sy + (ey - sy) * t1
-                    seg_ez = sz + (ez - sz) * t1
-                    
-                    # Determina fase basata sulla distanza di inizio segmento
-                    if seg_start_dist < eff_ramp_up:
-                        phase = "RAMP_UP"
-                    elif (total_length - seg_start_dist) < eff_ramp_down:
-                        phase = "RAMP_DOWN"
-                    else:
-                        phase = "STEADY"
-                    
-                    # Calcola feedrate
-                    new_feedrate = move.feedrate * speed_factor
-                    
-                    cmd = self._generate_segment_command(
-                        sx + (ex - sx) * t0, sy + (ey - sy) * t0, sz + (ez - sz) * t0, 0,
-                        seg_ex, seg_ey, seg_ez, e_per_segment,
-                        new_feedrate, phase, speed_factor, has_z
-                    )
-                    result.append(cmd)
-            else:
-                # Movimento non necessita segmentazione
-                dist_mid = move_start_dist + move.length / 2
-                dist_to_end = total_length - dist_mid
-                
-                speed_factor = calculate_speed_factor(
-                    dist_mid,
-                    dist_to_end,
-                    eff_ramp_up,
-                    eff_ramp_down,
-                    self.config.ramp_up_curve,
-                    self.config.ramp_down_curve
-                )
-                speed_factor = max(speed_factor, self.config.min_speed_ratio)
-                
-                new_feedrate = move.feedrate * speed_factor
-                
-                # Determina fase
-                if dist_mid < eff_ramp_up:
-                    phase = f"RAMP_UP {speed_factor*100:.0f}%"
-                elif dist_to_end < eff_ramp_down:
-                    phase = f"RAMP_DOWN {speed_factor*100:.0f}%"
-                else:
-                    phase = "STEADY"
-                
-                new_params = move.command.params.copy()
-                new_params["F"] = new_feedrate
-                
-                original_comment = move.command.comment or ""
-                new_comment = f"{original_comment} ; {phase}" if original_comment else phase
-                
-                new_cmd = GCodeCommand(
-                    line_number=move.command.line_number,
-                    raw_line=move.command.raw_line,
-                    command="G1",
-                    params=new_params,
-                    comment=new_comment,
-                    _modified=True
-                )
-                result.append(new_cmd)
-            
-            cumulative_distance = move_end_dist
-        
-        # Aggiungi commento di fine
-        result.append(GCodeCommand(
-            line_number=0,
-            raw_line="",
-            comment="PRESSURE_SMOOTHING_END",
-            _modified=True
-        ))
-        
-        return result
-    
+
+    # -------- API -----------------------------------------------------------
+
     def process_file(self, input_path: str, output_path: str) -> ProcessingStats:
-        """
-        Processa un file G-code applicando pressure smoothing.
-        
-        Args:
-            input_path: Percorso del file G-code di input
-            output_path: Percorso del file G-code di output
-            
-        Returns:
-            Statistiche del processing
-        """
-        start_time = time.time()
-        
-        # Reset stats
+        t0 = time.time()
         self.stats = ProcessingStats()
-        
-        # 1. Parsa il file
-        print(f"Parsing: {input_path}")
+
         commands = self.parser.parse_file(input_path)
         self.stats.input_lines = len(commands)
-        print(f"  Linee lette: {self.stats.input_lines}")
-        
-        # 2. Analizza e identifica percorsi
-        print("Analisi percorsi di estrusione...")
-        paths = self.analyzer.analyze(commands)
-        self.stats.paths_found = len(paths)
-        print(f"  Percorsi trovati: {self.stats.paths_found}")
-        
-        # 3. Crea mappa linea -> percorso per sostituzione efficiente
-        line_to_path: Dict[int, ExtrusionPath] = {}
-        lines_to_remove: set = set()  # Linee da rimuovere (percorsi troppo corti)
-        
-        for path in paths:
-            if self._should_process_path(path):
-                for move in path.moves:
-                    line_to_path[move.line_number] = path
-                self.stats.paths_processed += 1
-                self.stats.total_path_length += path.total_length
-            else:
-                # Percorso troppo corto - rimuovi completamente
-                for move in path.moves:
-                    lines_to_remove.add(move.line_number)
-                self.stats.paths_skipped += 1
-        
-        print(f"  Percorsi da processare: {self.stats.paths_processed}")
-        print(f"  Percorsi saltati (rimossi): {self.stats.paths_skipped}")
-        
-        # 4. Genera output
-        print("Generazione output...")
-        output_commands: List[GCodeCommand] = []
-        processed_paths: set = set()
-        
-        for cmd in commands:
-            line_num = cmd.line_number
-            
-            # Salta linee da rimuovere (percorsi troppo corti)
-            if line_num in lines_to_remove:
+
+        lines = self._build_lines(commands)
+        polylines = self._detect_polylines(lines)
+        self.stats.polylines_found = len(polylines)
+
+        polylines = self._merge_polylines(polylines, lines)
+        self.stats.polylines_after_merge = len(polylines)
+
+        cfg = self.config
+        for poly in polylines:
+            e_idxs = self._extr_indices(lines, poly)
+            if not e_idxs:
                 continue
-            
-            # Verifica se questa linea fa parte di un percorso da processare
-            if line_num in line_to_path:
-                path = line_to_path[line_num]
-                path_id = path.start_line  # Usa start_line come ID unico
-                
-                # Processa il percorso solo la prima volta che lo incontriamo
-                if path_id not in processed_paths:
-                    processed_paths.add(path_id)
-                    smoothed_commands = self._apply_smoothing_to_path(path)
-                    output_commands.extend(smoothed_commands)
-                # Altrimenti salta (già processato)
-            else:
-                # Linea non parte di un percorso - copia direttamente
-                output_commands.append(cmd)
-        
+            if len(e_idxs) >= 2:
+                self._backward_pass(lines, e_idxs, cfg.slope_neg_min)
+                self._forward_pass(lines, e_idxs, cfg.slope_pos_min)
+            if poly.travel_before >= cfg.travel_threshold:
+                self._boundary_rampup(lines, e_idxs, cfg.slope_pos_min, cfg.min_rate_min)
+                self.stats.boundary_rampups += 1
+            if poly.travel_after >= cfg.travel_threshold:
+                self._boundary_rampdown(lines, e_idxs, cfg.slope_neg_min, cfg.min_rate_min)
+                self.stats.boundary_rampdowns += 1
+
+        output_commands = self._emit(commands, lines)
         self.stats.output_lines = len(output_commands)
-        
-        # 5. Scrivi output
-        print(f"Scrittura: {output_path}")
+
         write_gcode(output_commands, output_path)
-        
-        # Calcola tempo totale
-        self.stats.processing_time = time.time() - start_time
-        
-        print(f"\nCompletato in {self.stats.processing_time:.2f}s")
-        print(f"  Input: {self.stats.input_lines} linee")
-        print(f"  Output: {self.stats.output_lines} linee")
-        
+        self.stats.processing_time = time.time() - t0
         return self.stats
+
+    # -------- Build -----------------------------------------------------------
+
+    def _build_lines(self, commands: List[GCodeCommand]) -> List[_Line]:
+        cfg = self.config
+        A_f = cfg.filament_area
+
+        # stato macchina
+        x = y = z = 0.0
+        e_abs = 0.0
+        f = 0.0
+        rel_e = False
+
+        out: List[_Line] = []
+
+        for idx, cmd in enumerate(commands):
+            if cmd.command == "M82":
+                rel_e = False
+                out.append(_Line(cmd_idx=idx, kind="other"))
+                continue
+            if cmd.command == "M83":
+                rel_e = True
+                out.append(_Line(cmd_idx=idx, kind="other"))
+                continue
+            if cmd.command == "G92":
+                if "E" in cmd.params:
+                    e_abs = cmd.params["E"]
+                if "X" in cmd.params:
+                    x = cmd.params["X"]
+                if "Y" in cmd.params:
+                    y = cmd.params["Y"]
+                if "Z" in cmd.params:
+                    z = cmd.params["Z"]
+                out.append(_Line(cmd_idx=idx, kind="other"))
+                continue
+
+            if cmd.command not in ("G0", "G1"):
+                out.append(_Line(cmd_idx=idx, kind="other"))
+                continue
+
+            # G0 / G1
+            has_xyz = any(k in cmd.params for k in ("X", "Y", "Z"))
+            has_e = "E" in cmd.params
+            has_z = "Z" in cmd.params
+            new_f = cmd.params.get("F", f)
+
+            if not has_xyz:
+                # F-only e/o E-only (retract) - non e' un movimento geometrico
+                if has_e:
+                    if rel_e:
+                        e_abs += cmd.params["E"]
+                    else:
+                        e_abs = cmd.params["E"]
+                if "F" in cmd.params:
+                    f = new_f
+                out.append(_Line(cmd_idx=idx, kind="other"))
+                continue
+
+            ex = cmd.params.get("X", x)
+            ey = cmd.params.get("Y", y)
+            ez = cmd.params.get("Z", z)
+
+            if has_e:
+                if rel_e:
+                    dE = cmd.params["E"]
+                    new_e = e_abs + dE
+                else:
+                    new_e = cmd.params["E"]
+                    dE = new_e - e_abs
+            else:
+                dE = 0.0
+                new_e = e_abs
+
+            dx = ex - x
+            dy = ey - y
+            dz = ez - z
+            dist_xyz = math.sqrt(dx * dx + dy * dy + dz * dz)
+            dist_xy = math.sqrt(dx * dx + dy * dy)
+
+            line = _Line(
+                cmd_idx=idx,
+                kind="other",
+                sx=x, sy=y, sz=z,
+                ex=ex, ey=ey, ez=ez,
+                dist_xyz=dist_xyz,
+                dist_xy=dist_xy,
+                has_z=has_z,
+                dE=dE if dE > 0 else 0.0,
+                F=new_f,
+                relative_e=rel_e,
+            )
+
+            # classifica
+            if dE > 0 and dist_xy > 0 and dist_xyz > 0 and new_f > 0:
+                line.kind = "extrude"
+                line.vol = A_f * new_f * dE / dist_xyz
+                line.rate_start = line.vol
+                line.rate_end = line.vol
+                self.stats.extruding_lines += 1
+            elif dist_xyz > 0:
+                line.kind = "travel"
+            else:
+                line.kind = "other"
+
+            out.append(line)
+
+            # aggiorna stato
+            x, y, z = ex, ey, ez
+            e_abs = new_e
+            if "F" in cmd.params:
+                f = new_f
+
+        return out
+
+    # -------- Polylines -----------------------------------------------------
+
+    def _detect_polylines(self, lines: List[_Line]) -> List[_Polyline]:
+        polys: List[_Polyline] = []
+        n = len(lines)
+        i = 0
+        travel_accum = 0.0
+        while i < n:
+            L = lines[i]
+            if L.kind == "travel":
+                travel_accum += L.dist_xy
+                i += 1
+            elif L.kind == "other":
+                i += 1
+            else:  # 'extrude'
+                first = i
+                last = i
+                j = i + 1
+                while j < n:
+                    Lj = lines[j]
+                    if Lj.kind == "extrude":
+                        last = j
+                        j += 1
+                    elif Lj.kind == "other":
+                        j += 1
+                    else:
+                        break
+                polys.append(_Polyline(first=first, last=last, travel_before=travel_accum))
+                travel_accum = 0.0
+                i = j
+
+        # travel_after per ogni polilinea
+        for k, p in enumerate(polys):
+            end_search = polys[k + 1].first if (k + 1) < len(polys) else n
+            s = 0.0
+            for j in range(p.last + 1, end_search):
+                if lines[j].kind == "travel":
+                    s += lines[j].dist_xy
+            p.travel_after = s
+
+        return polys
+
+    def _merge_polylines(
+        self, polylines: List[_Polyline], lines: List[_Line]
+    ) -> List[_Polyline]:
+        if not polylines:
+            return polylines
+        threshold = self.config.travel_threshold
+        merged: List[_Polyline] = [polylines[0]]
+        for p in polylines[1:]:
+            if p.travel_before < threshold:
+                # fondi nel precedente: estendi 'last' e adotta travel_after del nuovo
+                prev = merged[-1]
+                prev.last = p.last
+                prev.travel_after = p.travel_after
+            else:
+                merged.append(p)
+        return merged
+
+    @staticmethod
+    def _extr_indices(lines: List[_Line], poly: _Polyline) -> List[int]:
+        return [i for i in range(poly.first, poly.last + 1) if lines[i].kind == "extrude"]
+
+    # -------- Passate §5 ----------------------------------------------------
+
+    @staticmethod
+    def _backward_pass(lines: List[_Line], e_idxs: List[int], slope_neg: float) -> None:
+        # da last_e_idx verso first_e_idx
+        for k in range(len(e_idxs) - 2, -1, -1):
+            i = e_idxs[k]
+            nxt = e_idxs[k + 1]
+            L = lines[i]
+            Ln = lines[nxt]
+            if L.F <= 0 or L.dist_xyz <= 0 or L.vol <= 0:
+                continue
+            cand2 = Ln.rate_start * Ln.rate_start + 2.0 * slope_neg * L.vol * L.dist_xyz / L.F
+            if cand2 < 0:
+                cand2 = 0.0
+            cand = math.sqrt(cand2)
+            if cand < L.rate_start:
+                L.rate_start = cand
+                if Ln.rate_start < L.rate_end:
+                    L.rate_end = Ln.rate_start
+
+    @staticmethod
+    def _forward_pass(lines: List[_Line], e_idxs: List[int], slope_pos: float) -> None:
+        for k in range(1, len(e_idxs)):
+            i = e_idxs[k]
+            prv = e_idxs[k - 1]
+            L = lines[i]
+            Lp = lines[prv]
+            if L.F <= 0 or L.dist_xyz <= 0 or L.vol <= 0:
+                continue
+            cand2 = Lp.rate_end * Lp.rate_end + 2.0 * slope_pos * L.vol * L.dist_xyz / L.F
+            if cand2 < 0:
+                cand2 = 0.0
+            cand = math.sqrt(cand2)
+            if cand < L.rate_end:
+                L.rate_end = cand
+                if Lp.rate_end < L.rate_start:
+                    L.rate_start = Lp.rate_end
+
+    # -------- Rampe di confine §6 -------------------------------------------
+
+    @staticmethod
+    def _boundary_rampup(
+        lines: List[_Line], e_idxs: List[int], slope_pos: float, min_rate: float
+    ) -> None:
+        if not e_idxs:
+            return
+        ramp_target = lines[e_idxs[0]].vol
+        rate_prec = min_rate
+        for i in e_idxs:
+            if rate_prec >= ramp_target:
+                break
+            L = lines[i]
+            if L.F <= 0 or L.dist_xyz <= 0 or L.vol <= 0:
+                continue
+            L.rate_start = rate_prec
+            cand2 = rate_prec * rate_prec + 2.0 * slope_pos * L.vol * L.dist_xyz / L.F
+            if cand2 < 0:
+                cand2 = 0.0
+            new_end = min(ramp_target, math.sqrt(cand2))
+            L.rate_end = new_end
+            rate_prec = new_end
+
+    @staticmethod
+    def _boundary_rampdown(
+        lines: List[_Line], e_idxs: List[int], slope_neg: float, min_rate: float
+    ) -> None:
+        if not e_idxs:
+            return
+        ramp_target = lines[e_idxs[-1]].vol
+        rate_succ = min_rate
+        for i in reversed(e_idxs):
+            if rate_succ >= ramp_target:
+                break
+            L = lines[i]
+            if L.F <= 0 or L.dist_xyz <= 0 or L.vol <= 0:
+                continue
+            if rate_succ < L.rate_end:
+                L.rate_end = rate_succ
+            cand2 = rate_succ * rate_succ + 2.0 * slope_neg * L.vol * L.dist_xyz / L.F
+            if cand2 < 0:
+                cand2 = 0.0
+            cand = math.sqrt(cand2)
+            new_start = min(ramp_target, cand)
+            if new_start < L.rate_start:
+                L.rate_start = new_start
+            rate_succ = L.rate_start
+
+    # -------- Split §7 ------------------------------------------------------
+
+    def _split_line(self, L: _Line) -> List[Dict]:
+        """Restituisce una lista di micro-segmenti.
+
+        Ogni micro-segmento e' un dict:
+            {x, y, z, has_z, dE, F}
+        dE e' il delta-E relativo del micro-segmento (positivo).
+        F e' gia' quantizzato (multiplo di 60 mm/min, >= 60).
+        """
+        cfg = self.config
+        slope_pos = cfg.slope_pos_min
+        slope_neg = cfg.slope_neg_min
+        max_seg_len = cfg.max_seg_len
+        profile = cfg.profile
+
+        l = L.dist_xyz
+        vol = L.vol
+        F = L.F
+        rs = L.rate_start
+        re = L.rate_end
+        dE_total = L.dE
+
+        # parametrizzazione XYZ
+        sx, sy, sz = L.sx, L.sy, L.sz
+        ex, ey, ez = L.ex, L.ey, L.ez
+        has_z = L.has_z
+
+        out: List[Dict] = []
+        last_t = 0.0
+
+        def emit(t_global_end: float, F_q: float) -> None:
+            nonlocal last_t
+            t_global_end = min(1.0, max(0.0, t_global_end))
+            if t_global_end <= last_t:
+                return
+            dt = t_global_end - last_t
+            x = sx + (ex - sx) * t_global_end
+            y = sy + (ey - sy) * t_global_end
+            z = sz + (ez - sz) * t_global_end
+            dE_k = dE_total * dt
+            out.append({"x": x, "y": y, "z": z, "has_z": has_z, "dE": dE_k, "F": F_q})
+            last_t = t_global_end
+
+        # --- §7.1 caso semplice ---
+        near_full = (rs >= 0.98 * vol) and (re >= 0.98 * vol)
+        too_short = l <= 2.0 * max_seg_len
+        tiny_diff = round(abs(re - rs)) < 10
+        if near_full or too_short or tiny_diff:
+            avg = 0.5 * (rs + re) / vol if vol > 0 else 1.0
+            avg = max(0.05, min(1.0, avg))
+            F_out = quantize_feedrate(F * avg)
+            emit(1.0, F_out)
+            return out
+
+        # --- §7.2 / §7.3 ---
+        # lunghezze necessarie per portare il flusso a 'vol'
+        l_up = max(0.0, (vol * vol - rs * rs) * F / (2.0 * slope_pos * vol)) if slope_pos > 0 else 0.0
+        l_down = max(0.0, (vol * vol - re * re) * F / (2.0 * slope_neg * vol)) if slope_neg > 0 else 0.0
+
+        if l_up + l_down <= l:
+            # --- Trapezoidale ---
+            l_steady = l - l_up - l_down
+            # ramp-up
+            if l_up >= 0.5 * max_seg_len:
+                n_up = max(1, math.ceil(l_up / max_seg_len))
+                f_start_up = rs * F / vol
+                for k in range(1, n_up + 1):
+                    t_local = k / n_up
+                    t_global = t_local * (l_up / l)
+                    t_mid = (k - 0.5) / n_up
+                    F_mid = interpolate_feedrate(f_start_up, F, t_mid, profile)
+                    emit(t_global, quantize_feedrate(F_mid))
+            steady_end_t = (l_up + l_steady) / l
+            # steady
+            if l_steady >= 0.5 * max_seg_len:
+                emit(steady_end_t, quantize_feedrate(F))
+            # ramp-down
+            if l_down >= 0.5 * max_seg_len:
+                n_down = max(1, math.ceil(l_down / max_seg_len))
+                f_end_down = re * F / vol
+                for k in range(1, n_down + 1):
+                    t_local = k / n_down
+                    t_global = steady_end_t + t_local * (l_down / l)
+                    t_mid = (k - 0.5) / n_down
+                    F_mid = interpolate_feedrate(F, f_end_down, t_mid, profile)
+                    emit(t_global, quantize_feedrate(F_mid))
+        else:
+            # --- Triangolare ---
+            k_pos = 2.0 * slope_pos * vol / F if F > 0 else 0.0
+            k_neg = 2.0 * slope_neg * vol / F if F > 0 else 0.0
+            denom = k_pos + k_neg
+            if denom > 0:
+                x_meet = (re * re - rs * rs + k_neg * l) / denom
+            else:
+                x_meet = l * 0.5
+            x_meet = max(0.0, min(l, x_meet))
+            peak2 = rs * rs + k_pos * x_meet
+            if peak2 < 0:
+                peak2 = 0.0
+            peak = min(vol, math.sqrt(peak2))
+            f_peak = peak * F / vol
+            f_start_up = rs * F / vol
+            f_end_down = re * F / vol
+
+            # n_up = 0 se la zona ramp-up e' troppo corta: ricade nel catch-all
+            if x_meet >= 0.5 * max_seg_len:
+                n_up = max(1, math.ceil(x_meet / max_seg_len))
+                for k in range(1, n_up + 1):
+                    t_local = k / n_up
+                    t_global = t_local * (x_meet / l)
+                    t_mid = (k - 0.5) / n_up
+                    F_mid = interpolate_feedrate(f_start_up, f_peak, t_mid, profile)
+                    emit(t_global, quantize_feedrate(F_mid))
+            if (l - x_meet) >= 0.5 * max_seg_len:
+                n_down = max(1, math.ceil((l - x_meet) / max_seg_len))
+                for k in range(1, n_down + 1):
+                    t_local = k / n_down
+                    t_global = (x_meet / l) + t_local * ((l - x_meet) / l)
+                    t_mid = (k - 0.5) / n_down
+                    F_mid = interpolate_feedrate(f_peak, f_end_down, t_mid, profile)
+                    emit(t_global, quantize_feedrate(F_mid))
+
+        # --- catch-all ---
+        # Spec §7: chiudi fino a P1 se restano > 0.01 mm su XY.
+        if last_t < 1.0:
+            remaining_xy = L.dist_xy * (1.0 - last_t)
+            if remaining_xy > 0.01:
+                emit(1.0, quantize_feedrate(F))
+
+        # se per qualche motivo nessun micro-segmento e' stato emesso, fallback
+        if not out:
+            avg = 0.5 * (rs + re) / vol if vol > 0 else 1.0
+            avg = max(0.05, min(1.0, avg))
+            emit(1.0, quantize_feedrate(F * avg))
+
+        return out
+
+    # -------- Emissione -----------------------------------------------------
+
+    def _needs_split(self, L: _Line) -> bool:
+        if L.kind != "extrude" or L.vol <= 0:
+            return False
+        eps = 1e-6
+        return (abs(L.rate_start - L.vol) > eps) or (abs(L.rate_end - L.vol) > eps)
+
+    def _emit(
+        self, commands: List[GCodeCommand], lines: List[_Line]
+    ) -> List[GCodeCommand]:
+        out: List[GCodeCommand] = []
+
+        # tracking dello stato E in uscita (assoluto/relativo)
+        e_abs = 0.0
+        rel_e = False
+
+        last_emitted_idx = -1
+
+        for L in lines:
+            cmd_idx = L.cmd_idx
+            # emetti tutti i commands tra l'ultimo emesso e questo escluso
+            # (in pratica _Line copre 1:1 i commands, quindi non dovrebbe servire,
+            # ma manteniamo robusto)
+            for j in range(last_emitted_idx + 1, cmd_idx):
+                out.append(commands[j])
+            last_emitted_idx = cmd_idx
+            cmd = commands[cmd_idx]
+
+            # gestisci modalita' E
+            if cmd.command == "M82":
+                rel_e = False
+                out.append(cmd)
+                continue
+            if cmd.command == "M83":
+                rel_e = True
+                out.append(cmd)
+                continue
+            if cmd.command == "G92":
+                if "E" in cmd.params:
+                    e_abs = cmd.params["E"]
+                out.append(cmd)
+                continue
+
+            if not self._needs_split(L):
+                # emetti invariata; aggiorna stato E
+                out.append(cmd)
+                if cmd.command in ("G0", "G1") and "E" in cmd.params:
+                    if rel_e:
+                        e_abs += cmd.params["E"]
+                    else:
+                        e_abs = cmd.params["E"]
+                continue
+
+            # split
+            microsegs = self._split_line(L)
+            self.stats.lines_split += 1
+            self.stats.micro_segments_emitted += len(microsegs)
+
+            comment = cmd.comment
+            for j, ms in enumerate(microsegs):
+                params: Dict[str, float] = {"X": ms["x"], "Y": ms["y"]}
+                if ms["has_z"]:
+                    params["Z"] = ms["z"]
+                # E
+                if rel_e:
+                    params["E"] = ms["dE"]
+                    e_abs += ms["dE"]
+                else:
+                    e_abs += ms["dE"]
+                    params["E"] = e_abs
+                params["F"] = ms["F"]
+
+                new_cmd = GCodeCommand(
+                    line_number=0,
+                    raw_line="",
+                    command="G1",
+                    params=params,
+                    comment=comment if j == 0 else None,
+                    _modified=True,
+                )
+                out.append(new_cmd)
+
+        # eventuali commands rimanenti dopo l'ultimo _Line
+        for j in range(last_emitted_idx + 1, len(commands)):
+            out.append(commands[j])
+
+        return out
