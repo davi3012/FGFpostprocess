@@ -45,15 +45,15 @@ class ProcessorConfig:
     """
 
     # --- pendenze (input in mm^3/s^2) ---
-    max_volumetric_extrusion_rate_slope: float = 1.0  # mm^3/s^2 (accel.)
+    max_volumetric_extrusion_rate_slope: float = 150.0  # mm^3/s^2 (accel.)
     pellet_ers_deceleration_slope: float = 0.0        # mm^3/s^2 (decel.); <=0 => uguale a accel.
 
     # --- segmentazione e bordi ---
-    max_seg_len: float = 2.0          # mm
+    max_seg_len: float = 1.0          # mm
     travel_threshold: float = 3.0     # mm (XY)
 
     # --- soglia inferiore di flusso al bordo (input in mm^3/s) ---
-    pellet_ers_min_rate: float = 0.5  # mm^3/s
+    pellet_ers_min_rate: float = 50.0  # mm^3/s
 
     # --- profilo della rampa di feedrate ---
     profile: Profile = Profile.SQRT

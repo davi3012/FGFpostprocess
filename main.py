@@ -40,24 +40,24 @@ def main() -> None:
     p.add_argument("output", type=str, help="File G-code di output")
 
     p.add_argument(
-        "--slope-pos", type=float, default=1.0,
-        help="Pendenza accelerazione del flusso (mm^3/s^2). Default: 1.0",
+        "--slope-pos", type=float, default=150.0,
+        help="Pendenza accelerazione del flusso (mm^3/s^2). Default: 150.0",
     )
     p.add_argument(
         "--slope-neg", type=float, default=0.0,
         help="Pendenza decelerazione (mm^3/s^2). Se <=0 usa --slope-pos. Default: 0.0",
     )
     p.add_argument(
-        "--max-seg-len", type=float, default=2.0,
-        help="Lunghezza max dei sotto-segmenti dello split (mm). Default: 2.0",
+        "--max-seg-len", type=float, default=1.0,
+        help="Lunghezza max dei sotto-segmenti dello split (mm). Default: 1.0",
     )
     p.add_argument(
         "--travel-threshold", type=float, default=3.0,
         help="Soglia travel XY per attivare le rampe di confine (mm). Default: 3.0",
     )
     p.add_argument(
-        "--min-rate", type=float, default=0.5,
-        help="Flusso ai bordi della rampa (mm^3/s). Default: 0.5",
+        "--min-rate", type=float, default=50.0,
+        help="Flusso ai bordi della rampa (mm^3/s). Default: 50.0",
     )
     p.add_argument(
         "--profile", type=parse_profile, default=Profile.SQRT,

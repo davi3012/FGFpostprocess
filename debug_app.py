@@ -1,266 +1,206 @@
 """
-FGF G-code Post Processor - Debug UI (Pellet ERS)
+FGF G-code Post Processor - Pellet ERS
 
-Interfaccia Streamlit per il post-processing volumetrico Pellet ERS.
+Web UI minimale: carica un G-code, processa, scarica.
 
-Esegui con: streamlit run debug_app.py
+Esegui in locale con:
+    streamlit run debug_app.py
 """
 
 from __future__ import annotations
 
 import os
-import re
 import tempfile
+import time
 from pathlib import Path
 
-import numpy as np
-import plotly.graph_objects as go
 import streamlit as st
 
 from src import GCodeProcessor, Profile
 from src.processor import ProcessorConfig
-from src.smoothing import interpolate_feedrate
 
+
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="FGF Post Processor - Pellet ERS",
-    page_icon="🔧",
-    layout="wide",
+    page_title="FGF Post Processor — Pellet ERS",
+    page_icon="🟠",
+    layout="centered",
 )
 
-st.title("🔧 FGF G-code Post Processor — Pellet ERS")
+st.title("🟠 FGF Post Processor — Pellet ERS")
+st.caption(
+    "Smoothing volumetrico per stampanti FGF a pellet. "
+    "Carica un G-code, premi **Processa**, scarica il risultato."
+)
+
+# ---------------------------------------------------------------------------
+# Default parameters
+# ---------------------------------------------------------------------------
+
+DEFAULTS = {
+    "slope_pos": 150.0,           # mm^3/s^2
+    "slope_neg": 0.0,             # 0 = usa slope_pos
+    "max_seg_len": 1.0,           # mm
+    "travel_threshold": 3.0,      # mm
+    "min_rate": 50.0,             # mm^3/s
+    "profile": Profile.SQRT.value,
+}
 
 
 # ---------------------------------------------------------------------------
-# Visualizzazione
+# 1) Upload
 # ---------------------------------------------------------------------------
 
+st.subheader("1. Carica il G-code")
 
-_PARAM_RE = re.compile(r"([XYZEF])(-?\.?\d+\.?\d*)")
+uploaded = st.file_uploader(
+    "File G-code (.gcode / .gco / .nc)",
+    type=["gcode", "gco", "nc"],
+    label_visibility="collapsed",
+)
 
+# ---------------------------------------------------------------------------
+# 2) Parametri (con valori sensati di default + expander avanzati)
+# ---------------------------------------------------------------------------
 
-def parse_gcode_for_visualization(filepath: str) -> list[dict]:
-    """Parsa G-code ed estrae punti per la visualizzazione 3D."""
-    points: list[dict] = []
-    pos = {"X": 0.0, "Y": 0.0, "Z": 0.0, "E": 0.0, "F": 1500.0}
-    relative_e = False
+st.subheader("2. Parametri")
 
-    with open(filepath, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith(";"):
-                continue
-            if line.startswith("M83"):
-                relative_e = True
-                continue
-            if line.startswith("M82"):
-                relative_e = False
-                continue
-            if line.startswith("G92"):
-                for m in _PARAM_RE.finditer(line):
-                    if m.group(1) == "E":
-                        pos["E"] = float(m.group(2))
-                continue
-            if not (line.startswith("G1") or line.startswith("G0")):
-                continue
-
-            params = {m.group(1): float(m.group(2)) for m in _PARAM_RE.finditer(line)}
-
-            is_extrusion = False
-            if "E" in params:
-                if relative_e:
-                    is_extrusion = params["E"] > 0
-                    pos["E"] += params["E"]
-                else:
-                    is_extrusion = params["E"] > pos["E"]
-                    pos["E"] = params["E"]
-
-            has_xy = False
-            if "X" in params:
-                pos["X"] = params["X"]
-                has_xy = True
-            if "Y" in params:
-                pos["Y"] = params["Y"]
-                has_xy = True
-            if "Z" in params:
-                pos["Z"] = params["Z"]
-            if "F" in params:
-                pos["F"] = params["F"]
-
-            if has_xy:
-                points.append({
-                    "x": pos["X"], "y": pos["Y"], "z": pos["Z"],
-                    "f": pos["F"], "extrusion": is_extrusion,
-                })
-    return points
-
-
-def create_3d_plot(points: list[dict], extrusion_only: bool = True,
-                   z_range: tuple | None = None) -> go.Figure:
-    if extrusion_only:
-        pts = [p for p in points if p["extrusion"]]
-    else:
-        pts = points
-    if z_range:
-        pts = [p for p in pts if z_range[0] <= p["z"] <= z_range[1]]
-    if not pts:
-        return go.Figure()
-
-    fig = go.Figure(go.Scatter3d(
-        x=[p["x"] for p in pts],
-        y=[p["y"] for p in pts],
-        z=[p["z"] for p in pts],
-        mode="lines",
-        line=dict(
-            color=[p["f"] for p in pts],
-            colorscale="Turbo",
-            width=2,
-            colorbar=dict(title="F (mm/min)", thickness=20),
-        ),
-        hovertemplate="X:%{x:.2f}<br>Y:%{y:.2f}<br>Z:%{z:.2f}<extra></extra>",
-    ))
-    fig.update_layout(
-        scene=dict(xaxis_title="X (mm)", yaxis_title="Y (mm)", zaxis_title="Z (mm)",
-                   aspectmode="data"),
-        margin=dict(l=0, r=0, t=20, b=0),
-        height=600,
+c1, c2, c3 = st.columns(3)
+with c1:
+    slope_pos = st.number_input(
+        "Slope flusso (mm³/s²)",
+        min_value=0.1, max_value=10000.0,
+        value=DEFAULTS["slope_pos"], step=10.0,
+        help="Quanto in fretta il flusso volumetrico può variare. "
+             "Più alto = transizioni più aggressive.",
     )
-    return fig
-
-
-def plot_profile_preview() -> go.Figure:
-    """Confronto delle 3 forme di rampa (Linear, Sqrt, Exponential)."""
-    t = np.linspace(0, 1, 200)
-    fig = go.Figure()
-    f_start, f_end = 100.0, 1500.0
-    for prof in Profile:
-        ys = [interpolate_feedrate(f_start, f_end, ti, prof) for ti in t]
-        fig.add_trace(go.Scatter(x=t, y=ys, mode="lines", name=prof.value))
-    fig.update_layout(
-        title="Profili di rampa F (ramp-up 100→1500 mm/min)",
-        xaxis_title="t (0-1)", yaxis_title="F (mm/min)",
-        height=320, margin=dict(l=0, r=0, t=40, b=0),
+with c2:
+    min_rate = st.number_input(
+        "Flusso ai bordi (mm³/s)",
+        min_value=0.0, max_value=1000.0,
+        value=DEFAULTS["min_rate"], step=5.0,
+        help="Valore di flusso volumetrico all'inizio/fine di ogni polilinea.",
     )
-    return fig
+with c3:
+    max_seg_len = st.number_input(
+        "Risoluzione split (mm)",
+        min_value=0.1, max_value=10.0,
+        value=DEFAULTS["max_seg_len"], step=0.1,
+        help="Lunghezza massima di un micro-segmento generato dallo split.",
+    )
 
-
-# ---------------------------------------------------------------------------
-# Sidebar - parametri ERS
-# ---------------------------------------------------------------------------
-
-st.sidebar.header("⚙️ Parametri Pellet ERS")
-
-slope_pos = st.sidebar.number_input(
-    "max_volumetric_extrusion_rate_slope (mm³/s²)",
-    min_value=0.01, max_value=1000.0, value=1.0, step=0.1,
-)
-slope_neg = st.sidebar.number_input(
-    "pellet_ers_deceleration_slope (mm³/s², 0 = usa slope_pos)",
-    min_value=0.0, max_value=1000.0, value=0.0, step=0.1,
-)
-st.sidebar.caption(
-    "ℹ️ La E del G-code per estrusori a pellet e' gia' in mm³ "
-    "(Grasshopper applica il filament_diameter a monte): nessun parametro di sezione richiesto."
-)
-max_seg_len = st.sidebar.slider(
-    "max_seg_len (mm)", 0.5, 10.0, 2.0, 0.5,
-)
-travel_threshold = st.sidebar.slider(
-    "travel_threshold (mm)", 0.0, 20.0, 3.0, 0.5,
-)
-min_rate = st.sidebar.number_input(
-    "pellet_ers_min_rate (mm³/s)",
-    min_value=0.0, max_value=100.0, value=0.5, step=0.1,
-)
-profile_value = st.sidebar.selectbox(
-    "pellet_ers_ramp_profile",
-    [p.value for p in Profile],
-    index=[p.value for p in Profile].index(Profile.SQRT.value),
-)
-
-with st.sidebar.expander("📈 Preview profili rampa"):
-    st.plotly_chart(plot_profile_preview(), use_container_width=True)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-st.header("📂 G-code Post Processor")
-
-uploaded_file = st.file_uploader("Carica file G-code", type=["gcode", "gco", "nc"])
-
-if uploaded_file:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".gcode") as tmp:
-        tmp.write(uploaded_file.getvalue())
-        input_path = tmp.name
-
-    st.success(f"✅ File caricato: {uploaded_file.name}")
-
-    if st.button("▶️ Processa G-code", type="primary", use_container_width=True):
-        cfg = ProcessorConfig(
-            max_volumetric_extrusion_rate_slope=slope_pos,
-            pellet_ers_deceleration_slope=slope_neg,
-            max_seg_len=max_seg_len,
-            travel_threshold=travel_threshold,
-            pellet_ers_min_rate=min_rate,
-            profile=Profile(profile_value),
+with st.expander("Parametri avanzati"):
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        slope_neg = st.number_input(
+            "Slope decelerazione (mm³/s²)",
+            min_value=0.0, max_value=10000.0,
+            value=DEFAULTS["slope_neg"], step=10.0,
+            help="0 = usa lo stesso valore dello slope di accelerazione.",
+        )
+    with a2:
+        travel_threshold = st.number_input(
+            "Soglia travel (mm)",
+            min_value=0.0, max_value=50.0,
+            value=DEFAULTS["travel_threshold"], step=0.5,
+            help="Travel XY minimo per attivare le rampe di inizio/fine polilinea.",
+        )
+    with a3:
+        profile_value = st.selectbox(
+            "Profilo rampa",
+            [p.value for p in Profile],
+            index=[p.value for p in Profile].index(DEFAULTS["profile"]),
+            help="Forma della curva di interpolazione del feedrate nelle rampe.",
         )
 
-        output_path = input_path.replace(".gcode", "_processed.gcode")
+st.caption(
+    "ℹ️ La E del G-code è già in **mm³** (per estrusori a pellet Grasshopper "
+    "applica il filament_diameter a monte): non serve specificare alcuna sezione."
+)
 
-        with st.spinner("🔄 Processing in corso..."):
-            processor = GCodeProcessor(cfg)
-            stats = processor.process_file(input_path, output_path)
+# ---------------------------------------------------------------------------
+# 3) Processa
+# ---------------------------------------------------------------------------
 
-        st.success("✅ Processing completato!")
+st.subheader("3. Processa")
 
-        st.subheader("📊 Statistiche")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Linee input", f"{stats.input_lines:,}")
-        c2.metric("Linee output", f"{stats.output_lines:,}")
-        c3.metric("Polilinee (post-merge)",
-                  f"{stats.polylines_after_merge}",
-                  delta=f"trovate {stats.polylines_found}")
-        c4.metric("Tempo", f"{stats.processing_time:.2f}s")
+if uploaded is None:
+    st.info("👆 Carica un file G-code per iniziare.")
+    st.stop()
 
-        c5, c6, c7, c8 = st.columns(4)
-        c5.metric("Righe estrudenti", f"{stats.extruding_lines:,}")
-        c6.metric("Righe splittate", f"{stats.lines_split:,}")
-        c7.metric("Micro-segmenti", f"{stats.micro_segments_emitted:,}")
-        c8.metric("Boundary up/down",
-                  f"{stats.boundary_rampups}/{stats.boundary_rampdowns}")
+st.success(f"📄 File caricato: **{uploaded.name}** ({uploaded.size/1024:.1f} KB)")
 
-        with open(output_path, "r", encoding="utf-8") as f:
-            output_content = f.read()
+if "result" not in st.session_state:
+    st.session_state.result = None
 
-        st.download_button(
-            label="📥 Download G-code processato",
-            data=output_content,
-            file_name=f"{Path(uploaded_file.name).stem}_processed.gcode",
-            mime="text/plain",
-            type="primary",
-            use_container_width=True,
-        )
+if st.button("🚀 Processa G-code", type="primary", use_container_width=True):
+    cfg = ProcessorConfig(
+        max_volumetric_extrusion_rate_slope=slope_pos,
+        pellet_ers_deceleration_slope=slope_neg,
+        max_seg_len=max_seg_len,
+        travel_threshold=travel_threshold,
+        pellet_ers_min_rate=min_rate,
+        profile=Profile(profile_value),
+    )
 
-        # Visualizzazione 3D opzionale
-        with st.expander("🧭 Anteprima 3D feedrate (output)"):
-            try:
-                pts = parse_gcode_for_visualization(output_path)
-                if pts:
-                    st.plotly_chart(create_3d_plot(pts), use_container_width=True)
-                else:
-                    st.info("Nessun punto da mostrare.")
-            except Exception as e:
-                st.warning(f"Impossibile generare la preview: {e}")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path = os.path.join(tmpdir, uploaded.name)
+        out_path = os.path.join(tmpdir, "processed.gcode")
+        with open(in_path, "wb") as f:
+            f.write(uploaded.getvalue())
 
-        try:
-            os.unlink(output_path)
-            os.unlink(input_path)
-        except OSError:
-            pass
-else:
-    st.info("👆 Carica un file G-code per iniziare")
+        progress = st.progress(0, text="Processing...")
+        t0 = time.time()
+        processor = GCodeProcessor(cfg)
+        stats = processor.process_file(in_path, out_path)
+        progress.progress(100, text=f"Fatto in {time.time()-t0:.1f}s")
+
+        with open(out_path, "rb") as f:
+            output_bytes = f.read()
+
+    st.session_state.result = {
+        "name": Path(uploaded.name).stem + "_processed.gcode",
+        "data": output_bytes,
+        "stats": stats,
+    }
+
+# ---------------------------------------------------------------------------
+# 4) Risultato + download
+# ---------------------------------------------------------------------------
+
+result = st.session_state.result
+if result is not None:
+    st.subheader("4. Risultato")
+    s = result["stats"]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Linee in/out", f"{s.input_lines:,} → {s.output_lines:,}")
+    m2.metric("Polilinee", f"{s.polylines_after_merge}",
+              help=f"{s.polylines_found} prima del merge")
+    m3.metric("Micro-segmenti", f"{s.micro_segments_emitted:,}")
+    m4.metric("Tempo", f"{s.processing_time:.1f}s")
+
+    n1, n2, n3 = st.columns(3)
+    n1.metric("Righe estrudenti", f"{s.extruding_lines:,}")
+    n2.metric("Righe splittate", f"{s.lines_split:,}")
+    n3.metric("Rampe up / down",
+              f"{s.boundary_rampups} / {s.boundary_rampdowns}")
+
+    st.download_button(
+        label="📥 Scarica G-code processato",
+        data=result["data"],
+        file_name=result["name"],
+        mime="text/plain",
+        type="primary",
+        use_container_width=True,
+    )
+
+# ---------------------------------------------------------------------------
+# Footer
+# ---------------------------------------------------------------------------
 
 st.markdown("---")
-st.caption("FGF G-code Post Processor v2.0.0 — Pellet ERS Debug UI")
+st.caption("FGF G-code Post Processor v2.0.0 · Pellet ERS")
